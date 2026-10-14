@@ -96,15 +96,18 @@ interface State {
   references: Set<string>;
   requests: Map<string, TargetRecord>;
   blocked: boolean;
+  blockedCode?: string;
   dirty: boolean;
   pendingBytes: number;
 }
 interface Fence {
   input: ControlInput;
-  drain: Promise<Record<string, unknown>>;
+  drain?: Promise<Record<string, unknown>>;
+  drained?: Record<string, unknown>;
   active: boolean;
   releaseInput?: string;
   release?: Promise<Record<string, unknown>>;
+  released?: Record<string, unknown>;
 }
 interface RecoveryAttempt {
   requestId: string;
@@ -696,6 +699,8 @@ export class CollaborationRuntime {
   }
   private block(state: State, code: string): void {
     state.blocked = true;
+    if (state.blockedCode === undefined || state.blockedCode === 'STORE_UNCONFIRMED')
+      state.blockedCode = code;
     state.document
       ?.getConnections()
       .forEach((connection) => this.connectionError(connection, code));
@@ -1608,7 +1613,7 @@ export class CollaborationRuntime {
       if (existing) {
         if (phpJson(existing.input) !== phpJson(input))
           throw new Error('ORIGINAL_CONTROL_OPERATION_REQUIRED');
-        return existing.drain;
+        return this.drainControl(existing);
       }
       if (
         this.stopping ||
@@ -1619,11 +1624,10 @@ export class CollaborationRuntime {
       const fence: Fence = {
         input: JSON.parse(JSON.stringify(input)) as ControlInput,
         active: true,
-        drain: Promise.resolve().then(() => this.drainRoom(input)),
       };
       this.fences.set(input.room_key, fence);
       this.controlOperations.set(identity, fence);
-      return fence.drain;
+      return this.drainControl(fence);
     }
     if (
       !existing ||
@@ -1634,14 +1638,65 @@ export class CollaborationRuntime {
     )
       throw new Error('ORIGINAL_CONTROL_OPERATION_REQUIRED');
     const releaseInput = phpJson(input);
+    if (
+      existing.releaseInput !== undefined &&
+      existing.releaseInput !== releaseInput
+    )
+      throw new Error('ORIGINAL_CONTROL_RELEASE_REQUIRED');
+    if (existing.released) return existing.released;
     if (existing.release) {
       if (existing.releaseInput !== releaseInput)
         throw new Error('ORIGINAL_CONTROL_RELEASE_REQUIRED');
       return existing.release;
     }
     existing.releaseInput = releaseInput;
-    existing.release = this.releaseRoom(existing, input);
-    return existing.release;
+    const pending = this.releaseRoom(existing, input);
+    existing.release = pending;
+    void pending.then(
+      (result) => {
+        existing.released = result;
+        if (existing.release === pending) delete existing.release;
+      },
+      (error: unknown) => {
+        // Only a confirmed drain with an incomplete native unload can resume.
+        if (
+          this.code(error) === 'CONTROL_UNLOAD_UNCONFIRMED' &&
+          existing.drained &&
+          existing.release === pending
+        )
+          delete existing.release;
+      }
+    );
+    return pending;
+  }
+  private drainControl(fence: Fence): Promise<Record<string, unknown>> {
+    if (fence.drained) return Promise.resolve(fence.drained);
+    if (fence.drain) return fence.drain;
+    const pending = Promise.resolve().then(() => this.drainRoom(fence.input));
+    fence.drain = pending;
+    void pending.then(
+      (result) => {
+        fence.drained = result;
+        if (fence.drain === pending) delete fence.drain;
+      },
+      (error: unknown) => {
+        const state = [...this.states.values()].find(
+          (value) => value.auth.room_key === fence.input.room_key
+        );
+        // Native store hooks swallow failures. Distinguish exhausted/unknown
+        // storage from an invalid receipt or invalid accepted state before retry.
+        if (
+          this.code(error) === 'CONTROL_STORE_UNCONFIRMED' &&
+          state &&
+          state.auth.holder_key === fence.input.holder_key &&
+          state.auth.lease_epoch === fence.input.lease_epoch &&
+          (!state.blocked || state.blockedCode === 'STORE_UNCONFIRMED') &&
+          fence.drain === pending
+        )
+          delete fence.drain;
+      }
+    );
+    return pending;
   }
   private async drainRoom(
     input: ControlInput
@@ -1705,7 +1760,10 @@ export class CollaborationRuntime {
     fence: Fence,
     input: ControlInput
   ): Promise<Record<string, unknown>> {
-    await fence.drain;
+    if (!fence.drained) {
+      if (!fence.drain) throw new Error('CONTROL_DRAIN_UNCONFIRMED');
+      await fence.drain;
+    }
     const state = [...this.states.values()].find(
       (value) => value.auth.room_key === input.room_key
     );
@@ -1714,6 +1772,8 @@ export class CollaborationRuntime {
       throw new Error('CONTROL_HOLDER_CHANGED');
     if (state && state.auth.lease_epoch !== input.lease_epoch)
       throw new Error('CONTROL_EPOCH_CHANGED');
+    if (state && (state.capture || state.dirty))
+      throw new Error('CONTROL_RELEASE_STATE_UNCONFIRMED');
     if (document) {
       document
         .getConnections()
