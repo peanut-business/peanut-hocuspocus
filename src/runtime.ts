@@ -999,8 +999,15 @@ export class CollaborationRuntime {
     let receipt: Receipt | null = null;
     // An exhausted store budget may still observe its original durable receipt;
     // it never permits another store attempt or a replacement identity.
-    if (capture.attempted && capture.failures >= 3)
-      receipt = await this.receipt(capture);
+    if (capture.attempted && capture.failures >= 3) {
+      try {
+        receipt = await this.receipt(capture);
+      } catch (error) {
+        if (this.code(error) === 'PHP_COMMITTED_RECEIPT_INVALID')
+          this.block(state, 'COMMITTED_RECEIPT_INVALID');
+        throw error;
+      }
+    }
     while (!receipt && capture.failures < 3) {
       try {
         if (capture.attempted) receipt = await this.receipt(capture);
