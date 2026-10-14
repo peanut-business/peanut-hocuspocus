@@ -1,0 +1,6 @@
+# Save the instance-specific file outside tracked source; no default host/port/network.
+COMPOSE_PROJECT_NAME=
+COLLABORATION_PROGRAM_ROOT=
+COLLABORATION_SECRET_DIRECTORY=
+COLLABORATION_RUNTIME_ENV_FILE=
+COLLABORATION_NETWORK=

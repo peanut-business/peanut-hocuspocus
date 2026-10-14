@@ -1,0 +1,28 @@
+{
+  "name": "peanut-hocuspocus",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.23.2 <23"
+  },
+  "packageManager": "pnpm@9.15.6",
+  "scripts": {
+    "check": "tsc --noEmit --project tsconfig.json",
+    "build": "tsc --project tsconfig.json",
+    "start": "node dist/src/main.js"
+  },
+  "dependencies": {
+    "@hocuspocus/server": "4.6.0",
+    "@tiptap/y-tiptap": "3.0.9",
+    "@tiptap/pm": "3.30.5",
+    "crossws": "0.4.15",
+    "lib0": "0.2.117",
+    "y-protocols": "1.0.7",
+    "yjs": "13.6.32"
+  },
+  "devDependencies": {
+    "@types/node": "20.5.1",
+    "typescript": "5.9.3"
+  }
+}

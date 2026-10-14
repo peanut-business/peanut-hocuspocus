@@ -1,0 +1,37 @@
+services:
+  collaboration:
+    image: node:22.23.2-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9
+    user: "33:33"
+    working_dir: /srv/peanut-hocuspocus
+    command: [node, dist/src/main.js]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=1m"]
+    env_file: ["${COLLABORATION_RUNTIME_ENV_FILE:?explicit service configuration required}"]
+    environment:
+      COLLABORATION_SECRET_FILE: /run/peanut-collaboration/service-secret
+      NODE_EXTRA_CA_CERTS: /run/peanut-collaboration/ca.pem
+    volumes:
+      - type: bind
+        source: ${COLLABORATION_PROGRAM_ROOT:?explicit fixed program required}
+        target: /srv/peanut-hocuspocus
+        read_only: true
+      - type: bind
+        source: ${COLLABORATION_SECRET_DIRECTORY:?explicit service secret references required}
+        target: /run/peanut-collaboration
+        read_only: true
+    networks:
+      service:
+        aliases: [collaboration]
+    stop_grace_period: 1m
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:'+process.env.COLLABORATION_LISTEN_PORT+'/ready',{redirect:'error',credentials:'omit'}).then(r=>{if(r.status!==200)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 25s
+      retries: 3
+networks:
+  service:
+    external: true
+    name: ${COLLABORATION_NETWORK:?explicit registered interface network required}
