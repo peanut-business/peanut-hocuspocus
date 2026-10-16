@@ -1,12 +1,18 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { PhpClient } from './php-client.js';
-import { digest } from './contracts.js';
+import {
+  digest,
+  assertInvalidation,
+  type AccessInvalidationInput,
+  type AccessInvalidationAck,
+} from './contracts.js';
 import { sha } from './digests.js';
 
 export const controlPath =
   '/internal/collaboration/control/v1/business-barrier';
 export const operatorPath = '/internal/collaboration/operator/v1/lifecycle';
+export const accessPath = '/internal/collaboration/access/v1/invalidate';
 export interface ControlInput {
   protocol: 2;
   action: 'drain' | 'release';
@@ -51,7 +57,10 @@ export class Control {
     ) => Promise<Record<string, unknown>>,
     private readonly operator: (
       input: OperatorInput
-    ) => Promise<Record<string, unknown>>
+    ) => Promise<Record<string, unknown>>,
+    private readonly invalidate: (
+      input: AccessInvalidationInput
+    ) => Promise<AccessInvalidationAck>
   ) {}
 
   async handle(
@@ -59,8 +68,11 @@ export class Control {
     response: ServerResponse
   ): Promise<void> {
     const config = this.php.config;
-    const path = request.url === operatorPath ? operatorPath : controlPath;
-    const domain = path === operatorPath ? 'operator' : 'control';
+    const path = request.url === accessPath ? accessPath
+      : request.url === operatorPath ? operatorPath : controlPath;
+    const domain = path === accessPath ? 'access-invalidation-v1'
+      : path === operatorPath ? 'operator' : 'control';
+    const protocol = path === accessPath ? '1' : '2';
     let nonce = '',
       holderKey = '',
       bodyHash = '',
@@ -74,7 +86,7 @@ export class Control {
       createHmac('sha256', config.secret)
         .update(
           [
-            `peanut.collaboration.${domain}.${kind}.v2`,
+            `peanut.collaboration.${domain}.${kind}.v${protocol}`,
             config.instanceId,
             config.serviceInstanceId,
             config.keyId,
@@ -103,7 +115,7 @@ export class Control {
       const timestamp = header('timestamp'),
         signature = header('signature');
       if (
-        header('protocol') !== '2' ||
+        header('protocol') !== protocol ||
         header('service-instance') !== config.serviceInstanceId ||
         header('key-id') !== config.keyId ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
@@ -149,8 +161,17 @@ export class Control {
       authenticated = true;
       const input = JSON.parse(
         new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-      ) as ControlInput | OperatorInput;
-      if (domain === 'operator') {
+      );
+      if (path === accessPath) {
+        assertInvalidation(input);
+        if (input.instance_id !== config.instanceId
+          || input.service_instance_id !== config.serviceInstanceId
+          || input.holder_key !== holderKey || holderKey !== this.php.holderKey) {
+          throw new Error('ACCESS_INVALIDATION_HOLDER_CHANGED');
+        }
+        result = { ok: true, data: await this.invalidate(input) };
+        status = 200;
+      } else if (domain === 'operator') {
         if (
           !input ||
           input.protocol !== 2 ||
@@ -218,7 +239,7 @@ export class Control {
       const timestamp = String(Math.floor(Date.now() / 1000)),
         digest = sha(raw);
       Object.assign(headers, {
-        'X-Collaboration-Protocol': '2',
+        'X-Collaboration-Protocol': protocol,
         'X-Collaboration-Service-Instance': config.serviceInstanceId,
         'X-Collaboration-Key-Id': config.keyId,
         'X-Collaboration-Holder-Key': holderKey,

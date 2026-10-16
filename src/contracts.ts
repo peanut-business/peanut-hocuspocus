@@ -1,4 +1,99 @@
 import type { Structured } from './projector.js';
+import { canonical, sha } from './digests.js';
+
+export interface AccessInvalidationTarget {
+  connection_key: string;
+  room_key: string;
+  lease_epoch: number;
+  member_id: number;
+  authorization_revision: string;
+}
+export interface AccessInvalidationInput {
+  protocol_version: 1;
+  action: 'access.invalidate';
+  fact_id: string;
+  fact_sha256: string;
+  tenant_id: number;
+  subject: {
+    kind: 'member' | 'role' | 'session' | 'tenant_scope_account';
+    id: string;
+    member_id: number;
+  };
+  negative_action: 'invalidate_old_grant';
+  revision_reference_sha256: string;
+  operation_id: string;
+  instance_id: string;
+  service_instance_id: string;
+  holder_key: string;
+  targets: AccessInvalidationTarget[];
+  scope_digest: string;
+}
+export interface AccessInvalidationAck {
+  protocol_version: 1;
+  fact_id: string;
+  fact_sha256: string;
+  operation_id: string;
+  instance_id: string;
+  service_instance_id: string;
+  holder_key: string;
+  scope_digest: string;
+  outcome: 'applied' | 'no_matching_connection';
+  processed_at: string;
+  matched_count: number;
+  closed_count: number;
+}
+
+/** PHP canonical JSON_UNESCAPED_SLASHES: Unicode remains escaped, including surrogate pairs. */
+export function invalidationJson(value: unknown): string {
+  return JSON.stringify(canonical(value)).replace(
+    /[\u0080-\uffff]/g,
+    (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')
+  );
+}
+
+function exactObject(value: unknown, keys: string): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join(',') === keys;
+}
+const positiveId = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+
+export function assertInvalidation(value: unknown): asserts value is AccessInvalidationInput {
+  if (!exactObject(value, 'action,fact_id,fact_sha256,holder_key,instance_id,negative_action,operation_id,protocol_version,revision_reference_sha256,scope_digest,service_instance_id,subject,targets,tenant_id')
+    || value.protocol_version !== 1 || value.action !== 'access.invalidate'
+    || value.negative_action !== 'invalidate_old_grant'
+    || typeof value.fact_id !== 'string' || !/^revocation_[0-9a-f]{32}$/.test(value.fact_id)
+    || !digest(value.fact_sha256) || !digest(value.revision_reference_sha256) || !digest(value.scope_digest)
+    || !positiveId(value.tenant_id)
+    || !exactObject(value.subject, 'id,kind,member_id')
+    || !positiveId(value.subject.member_id)
+    || typeof value.subject.kind !== 'string'
+    || !['member', 'role', 'session', 'tenant_scope_account'].includes(value.subject.kind)
+    || typeof value.subject.id !== 'string'
+    || (value.subject.kind === 'session' ? !digest(value.subject.id) : !/^[1-9][0-9]{0,127}$/.test(value.subject.id))
+    || (value.subject.kind === 'member' && value.subject.id !== String(value.subject.member_id))
+    || typeof value.operation_id !== 'string' || !/^job_[0-9a-f]{32}:[0-9]{1,10}$/.test(value.operation_id)
+    || typeof value.holder_key !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.holder_key)
+    || [value.instance_id, value.service_instance_id].some((v) => typeof v !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(v))
+    || !Array.isArray(value.targets) || value.targets.length > 100) {
+    throw new Error('ACCESS_INVALIDATION_INPUT_INVALID');
+  }
+  const connections = new Set<string>();
+  for (const target of value.targets) {
+    if (!exactObject(target, 'authorization_revision,connection_key,lease_epoch,member_id,room_key')
+      || !digest(target.connection_key) || !digest(target.room_key) || !digest(target.authorization_revision)
+      || !positiveId(target.lease_epoch) || target.member_id !== value.subject.member_id
+      || connections.has(target.connection_key)) {
+      throw new Error('ACCESS_INVALIDATION_TARGET_INVALID');
+    }
+    connections.add(target.connection_key);
+  }
+  const { scope_digest: expected, ...scope } = value;
+  if (sha(invalidationJson(scope)) !== expected) {
+    throw new Error('ACCESS_INVALIDATION_SCOPE_INVALID');
+  }
+}
 
 export interface Owner {
   module_key: string;

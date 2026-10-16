@@ -4,6 +4,11 @@ import * as Y from 'yjs';
 import {
   assertAuth,
   assertBinding,
+  assertInvalidation,
+  invalidationJson,
+  type AccessInvalidationInput,
+  type AccessInvalidationTarget,
+  type AccessInvalidationAck,
   binary,
   digest,
   requestId,
@@ -28,6 +33,7 @@ import {
   Control,
   controlPath,
   operatorPath,
+  accessPath,
   type ControlInput,
   type OperatorInput,
 } from './business-control.js';
@@ -128,6 +134,11 @@ export class CollaborationRuntime {
   private readonly controlOperations = new Map<string, Fence>();
   private readonly recoveries = new Map<string, RecoveryAttempt>();
   private readonly control: Control;
+  // Exact negative tuples last for this process holder; never evict a fence for an in-flight grant.
+  private readonly invalidatedGrants = new Set<string>();
+  private readonly invalidationFacts = new Map<string, string>();
+  private readonly invalidationOperations = new Map<string, string>();
+  private readonly invalidationResults = new Map<string, AccessInvalidationAck>();
   private maintenance: ReturnType<typeof setInterval> | undefined;
   private stopping = false;
   private admissionOpen = false;
@@ -155,7 +166,8 @@ export class CollaborationRuntime {
     this.control = new Control(
       php,
       (input) => this.controlRoom(input),
-      (input) => this.operator(input)
+      (input) => this.operator(input),
+      async (input) => this.invalidateAccess(input)
     );
     this.server = new Server<Context>({
       address,
@@ -204,6 +216,7 @@ export class CollaborationRuntime {
           php.config.instanceId,
           php.holderKey
         );
+        this.assertGrantNotInvalidated(auth);
         if (this.fences.get(auth.room_key)?.active)
           throw new Error('DOCUMENT_BARRIER');
         let state = this.states.get(payload.documentName);
@@ -482,7 +495,7 @@ export class CollaborationRuntime {
           );
           throw undefined;
         }
-        if ([controlPath, operatorPath].includes(payload.request.url ?? '')) {
+        if ([controlPath, operatorPath, accessPath].includes(payload.request.url ?? '')) {
           await this.control.handle(payload.request, payload.response);
           throw undefined;
         }
@@ -665,6 +678,7 @@ export class CollaborationRuntime {
     const state = this.state(connection.document.name);
     const auth = connection.context?.auth;
     if (!auth) throw new Error('CONNECTION_AUTHORIZATION_REQUIRED');
+    this.assertGrantNotInvalidated(auth);
     this.sameRoom(state, auth);
     if (
       !connection.document.hasConnection(connection) ||
@@ -750,6 +764,8 @@ export class CollaborationRuntime {
       room_key: auth.room_key,
       lease_epoch: auth.lease_epoch,
     });
+    // An invalidation may arrive while PHP's load or the SDK's authentication is pending.
+    this.assertGrantNotInvalidated(auth);
     assertBinding(loaded.binding, document.name, this.php.config.instanceId);
     if (
       phpJson(loaded.binding) !== phpJson(auth.binding) ||
@@ -1547,6 +1563,7 @@ export class CollaborationRuntime {
     const original = context.auth;
     let deadline: ReturnType<typeof setTimeout> | undefined;
     try {
+      this.assertGrantNotInvalidated(original);
       const checked = await Promise.race([
         this.php.call<ConnectionAuth>('check', {
           connection_key: original.connection_key,
@@ -1574,6 +1591,8 @@ export class CollaborationRuntime {
       )
         throw new Error('CONNECTION_AUTHORIZATION_CHANGED');
       if (!connection.document.hasConnection(connection)) return;
+      this.assertGrantNotInvalidated(original);
+      this.assertGrantNotInvalidated(checked);
       context.auth = checked;
       context.checkedAt = Date.now();
       context.nextRenewal = this.renewalAt(checked);
@@ -1584,6 +1603,123 @@ export class CollaborationRuntime {
       if (deadline) clearTimeout(deadline);
       context.renewing = false;
     }
+  }
+
+  private invalidationTuple(
+    tenantId: number,
+    target: AccessInvalidationTarget
+  ): string {
+    return invalidationJson([
+      this.php.config.instanceId, this.php.config.edition, this.php.holderKey,
+      tenantId, target.member_id, target.connection_key, target.room_key,
+      target.lease_epoch, target.authorization_revision,
+    ]);
+  }
+
+  private assertGrantNotInvalidated(auth: ConnectionAuth): void {
+    if (this.invalidatedGrants.has(this.invalidationTuple(auth.binding.tenant_id, auth))) {
+      throw new Error('CONNECTION_ACCESS_INVALIDATED');
+    }
+  }
+
+  private assertInvalidationHolder(input: AccessInvalidationInput): void {
+    const state = this.lifecycleState;
+    if (input.instance_id !== this.php.config.instanceId
+      || input.service_instance_id !== this.php.config.serviceInstanceId
+      || input.holder_key !== this.php.holderKey || !state
+      || !['active', 'draining'].includes(String(state.phase))
+      || this.processLeaseExpires <= Date.now()) {
+      throw new Error('ACCESS_INVALIDATION_HOLDER_UNCONFIRMED');
+    }
+    this.validateLifecycle(state);
+  }
+
+  /** Synchronous mark/close critical section: no await can interleave grant renewal or ACK publication. */
+  private invalidateAccess(input: AccessInvalidationInput): AccessInvalidationAck {
+    assertInvalidation(input);
+    this.assertInvalidationHolder(input);
+    const fact = invalidationJson([
+      input.tenant_id, input.subject, input.fact_sha256,
+      input.negative_action, input.revision_reference_sha256,
+    ]);
+    const previousFact = this.invalidationFacts.get(input.fact_id);
+    if (previousFact !== undefined && previousFact !== fact) {
+      throw new Error('ACCESS_INVALIDATION_FACT_CHANGED');
+    }
+    const operation = this.invalidationOperations.get(input.operation_id);
+    if (operation !== undefined && operation !== input.scope_digest) {
+      throw new Error('ACCESS_INVALIDATION_OPERATION_CHANGED');
+    }
+    const resultKey = invalidationJson([
+      input.fact_id, input.service_instance_id, input.holder_key, input.scope_digest,
+    ]);
+    const previous = this.invalidationResults.get(resultKey);
+    if (previous) return { ...previous };
+
+    const targets = new Map(input.targets.map((target) => [target.connection_key, target]));
+    const tuples = input.targets.map((target) => this.invalidationTuple(input.tenant_id, target));
+    const additions = tuples.filter((tuple) => !this.invalidatedGrants.has(tuple));
+    // Reserve all marker/result/identity slots before changing any connection.
+    if (this.invalidatedGrants.size + additions.length > 100000
+      || (previousFact === undefined && this.invalidationFacts.size >= 10000)
+      || (operation === undefined && this.invalidationOperations.size >= 10000)
+      || this.invalidationResults.size >= 10000) {
+      throw new Error('ACCESS_INVALIDATION_BACKPRESSURE');
+    }
+    const matches = new Map<string, Connection<Context>[]>();
+    this.states.forEach((state) => {
+      state.document?.getConnections().forEach((connection: Connection<Context>) => {
+        const auth = connection.context?.auth;
+        if (!auth) throw new Error('ACCESS_INVALIDATION_CONNECTION_UNKNOWN');
+        const target = targets.get(auth.connection_key);
+        if (!target) return;
+        if (auth.binding.instance_id !== input.instance_id
+          || auth.binding.edition !== this.php.config.edition
+          || auth.holder_key !== input.holder_key
+          || auth.binding.tenant_id !== input.tenant_id
+          || auth.member_id !== input.subject.member_id) {
+          throw new Error('ACCESS_INVALIDATION_CONNECTION_SCOPE_INVALID');
+        }
+        if (auth.room_key !== target.room_key || auth.lease_epoch !== target.lease_epoch
+          || auth.authorization_revision !== target.authorization_revision) return;
+        const connections = matches.get(auth.connection_key) ?? [];
+        connections.push(connection);
+        matches.set(auth.connection_key, connections);
+      });
+    });
+
+    this.invalidationFacts.set(input.fact_id, fact);
+    this.invalidationOperations.set(input.operation_id, input.scope_digest);
+    tuples.forEach((tuple) => this.invalidatedGrants.add(tuple));
+    // Fence the whole batch before close callbacks, including duplicate SDK instances of one tuple.
+    matches.forEach((connections) => connections.forEach((connection) => { connection.readOnly = true; }));
+    let failed = false;
+    matches.forEach((connections) => connections.forEach((connection) => {
+      try {
+        connection.close({ code: 1008, reason: 'CONNECTION_ACCESS_INVALIDATED' });
+        if (connection.document.hasConnection(connection)) failed = true;
+      } catch {
+        failed = true;
+      }
+    }));
+    if (failed) throw new Error('ACCESS_INVALIDATION_CLOSE_UNCONFIRMED');
+    this.assertInvalidationHolder(input);
+    const ack: AccessInvalidationAck = {
+      protocol_version: 1,
+      fact_id: input.fact_id,
+      fact_sha256: input.fact_sha256,
+      operation_id: input.operation_id,
+      instance_id: input.instance_id,
+      service_instance_id: input.service_instance_id,
+      holder_key: input.holder_key,
+      scope_digest: input.scope_digest,
+      outcome: matches.size ? 'applied' : 'no_matching_connection',
+      processed_at: new Date().toISOString(),
+      matched_count: matches.size,
+      closed_count: matches.size,
+    };
+    this.invalidationResults.set(resultKey, ack);
+    return { ...ack };
   }
 
   private async flushDocument(document: Document): Promise<void> {
