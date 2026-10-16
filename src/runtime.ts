@@ -678,7 +678,7 @@ export class CollaborationRuntime {
     const state = this.state(connection.document.name);
     const auth = connection.context?.auth;
     if (!auth) throw new Error('CONNECTION_AUTHORIZATION_REQUIRED');
-    this.assertGrantNotInvalidated(auth);
+    this.assertGrantNotInvalidated(auth, connection);
     this.sameRoom(state, auth);
     if (
       !connection.document.hasConnection(connection) ||
@@ -811,6 +811,7 @@ export class CollaborationRuntime {
       await document.saveMutex.runExclusive(() =>
         this.persist(state, document)
       );
+      this.assertGrantNotInvalidated(auth);
       return;
     }
     if (
@@ -1616,8 +1617,12 @@ export class CollaborationRuntime {
     ]);
   }
 
-  private assertGrantNotInvalidated(auth: ConnectionAuth): void {
+  private assertGrantNotInvalidated(auth: ConnectionAuth, connection?: Connection<Context>): void {
     if (this.invalidatedGrants.has(this.invalidationTuple(auth.binding.tenant_id, auth))) {
+      if (connection) {
+        connection.readOnly = true;
+        connection.close({ code: 1008, reason: 'CONNECTION_ACCESS_INVALIDATED' });
+      }
       throw new Error('CONNECTION_ACCESS_INVALIDATED');
     }
   }

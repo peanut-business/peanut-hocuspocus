@@ -152,6 +152,8 @@ export class Control {
         )
       )
         throw new Error('CONTROL_AUTH_INVALID');
+      // Access-v1 replay/backpressure is an authenticated rejection, never an unsigned ACK failure.
+      if (path === accessPath) authenticated = true;
       this.nonces.forEach((expiry, key) => {
         if (expiry <= Date.now()) this.nonces.delete(key);
       });
