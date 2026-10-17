@@ -1241,7 +1241,7 @@ export class CollaborationRuntime {
     }
     const pending = this.php
       .call<Record<string, unknown>>('lifecycle', {
-        stage: 'paired_probe',
+        stage: 'paired_start',
         probe_id: this.probeId,
         full,
         ...this.lifecycleIdentity(),
@@ -1250,11 +1250,20 @@ export class CollaborationRuntime {
         this.validateLifecycle(value);
         this.lifecycleState = value;
         this.processLeaseExpires = Number(value.process_lease_expires_at_ms);
+        // Admission follows only the authenticated backend's committed pairing
+        // of this exact process/configuration. An outstanding drain stays closed.
+        const activation = value.activation_id;
         if (
-          value.phase !== 'active' ||
-          value.activation_id !== this.activationId
-        )
+          !this.stopping && !this.instanceDrain && value.phase === 'active' &&
+          value.admission_enabled === true && typeof activation === 'string' &&
+          requestId(activation) &&
+          (this.activationId === null || this.activationId === activation)
+        ) {
+          this.activationId = activation;
+          this.admissionOpen = true;
+        } else {
           this.admissionOpen = false;
+        }
         return value;
       });
     this.lifecyclePending = pending;

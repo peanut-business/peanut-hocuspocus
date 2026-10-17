@@ -7,6 +7,22 @@ const required = (key: string): string => {
   if (!value) throw new Error('SERVICE_CONFIGURATION_MISSING:' + key);
   return value;
 };
+// Standard Compose binds only this repository's certs directory. Validate the
+// repository view as well as the second mount, so an external host symlink or
+// an unrelated credentials mount cannot silently replace that boundary.
+const repositoryCerts = '/srv/peanut-hocuspocus/certs';
+const mountedCerts = '/run/peanut-collaboration';
+const repositoryDirectory = lstatSync(repositoryCerts);
+const mountedDirectory = lstatSync(mountedCerts);
+if (
+  !repositoryDirectory.isDirectory() || !mountedDirectory.isDirectory() ||
+  realpathSync(repositoryCerts) !== repositoryCerts ||
+  realpathSync(mountedCerts) !== mountedCerts ||
+  repositoryDirectory.dev !== mountedDirectory.dev ||
+  repositoryDirectory.ino !== mountedDirectory.ino ||
+  (repositoryDirectory.mode & 0o022) !== 0
+)
+  throw new Error('SERVICE_CERTIFICATE_DIRECTORY_INVALID');
 const secretPath = required('COLLABORATION_SECRET_FILE');
 const stat = lstatSync(secretPath);
 if (
