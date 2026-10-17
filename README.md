@@ -8,33 +8,39 @@
 
 `pnpm install --frozen-lockfile --ignore-scripts` 准备本项目自己的依赖；`pnpm build` 编译本项目源码，`pnpm check` 单独检查未构建的源码。构建已经完成类型检查时不重复运行 check。Node 固定为 22.23.2，pnpm 固定为 9.15.6，不从应用工作树复制 node_modules。
 
-Docker 运行固定镜像 `node:22.23.2-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9`，只读挂载本项目已编译程序及固定依赖。Compose 配置位于 docker/compose.yaml；实例必须显式提供程序、密钥文件引用、服务配置和已登记的接口网络。没有默认数据库、网络、端口、密钥或运行 fallback。公共 TLS/WSS 入口可以使用已有反向代理，应用源码不进入服务容器。
+仓库根目录的 `compose.yaml` 使用固定 Node 镜像，只读挂载本仓库的程序和依赖。运行配置统一放根目录 `.env`；各参数已在 `.env.example` 中用中文逐项说明，配置里不需要填写任何宿主机文件路径。Compose 按自身文件位置解析固定的相对挂载路径，克隆到其他目录无需修改路径。
 
-独立启停入口为 `python3 scripts/service.py start|status|stop --environment private/docker.env`。仓库根取实际 `scripts/service.py` 文件所在仓库，不取调用 cwd；在其他目录可用 `python3 /你的clone目录/scripts/service.py status --environment private/docker.env`。配置文件引用和其中的宿主路径均相对此仓库根解析，拒绝绝对输入、任何 `..` 分量和符号链接路径（包括仍指向仓库内的链接），不得引用仓库外的配置或密钥。容器内固定绝对路径不随 clone 位置改变。
+在仓库根目录准备配置并构建：
 
-将 `docker/environment.example`、`docker/runtime.example` 分别保存为本服务仓库的 `private/docker.env`、`private/runtime.env`，权限均为 0600；按应用已授权的固定配置填写下表，不在示例中填写真实凭据。入口先校验路径，再只向 Compose 子进程传规范化的宿主路径；不改写配置，也不依赖 shell 的工作目录或同名环境变量覆盖。通过本入口启停，不能将仓库根相对配置直接交给以 docker/ 为基准的 `docker compose up`。
+```sh
+cp .env.example .env
+chmod 600 .env
+# 编辑 .env，填写应用接口、身份、配置摘要、端口和已有 Docker 网络。
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm build
+```
 
-| docker.env 字段 | 含义 |
-| --- | --- |
-| `COMPOSE_PROJECT_NAME` | 本实例唯一的 Compose 项目名，显式填写。 |
-| `COLLABORATION_PROGRAM_ROOT` | 固定为 `.`，仅挂载当前服务仓库。 |
-| `COLLABORATION_SECRET_DIRECTORY` | 固定为 `private/collaboration/service`；放 service-secret 与 ca.pem。 |
-| `COLLABORATION_RUNTIME_ENV_FILE` | 固定为 `private/runtime.env`，此文件须为普通、单链接、0600 文件。 |
-| `COLLABORATION_NETWORK` | 应用已登记的外部接口网络，显式填写。 |
+私密文件只放在本服务自己的目录中，不提交到 Git：
 
-| runtime.env 字段 | 含义 |
-| --- | --- |
-| `COLLABORATION_PHP_ORIGIN` | 应用私有 HTTPS 接口 origin，禁止关闭 TLS 校验。 |
-| `COLLABORATION_INSTANCE_ID` / `COLLABORATION_SERVICE_INSTANCE_ID` | 应用实例与独立服务身份，须与应用配对配置一致。 |
-| `COLLABORATION_KEY_ID` | 既有服务密钥的标识；不是密钥值。 |
-| `COLLABORATION_EDITION` | 应用固定的部署形态。 |
-| `COLLABORATION_CONFIG_REVISION` / `COLLABORATION_CONFIG_SHA256` | 应用确认的配置修订与摘要。 |
-| `COLLABORATION_CA_SHA256` | 挂载 ca.pem 的 SHA-256，启动时验证。 |
-| `COLLABORATION_PHP_TIMEOUT_MS` | HTTPS 请求超时，毫秒；示例为 20000。 |
-| `COLLABORATION_LISTEN_ADDRESS` / `COLLABORATION_LISTEN_PORT` | 已授权的容器内监听地址和端口，无默认值。 |
+```text
+private/collaboration/service/
+├── service-secret
+└── ca.pem
+```
 
-service-secret 保持普通、单链接、0600、容器 UID 33 所有的文件；ca.pem 保持原 CA 权限、大小和摘要校验。Compose 仍将这两个文件所在目录只读挂载到 `/run/peanut-collaboration`，密钥与 CA 的容器内引用保持不变。不得复制票据密钥或数据库凭据。
+`service-secret` 使用与应用约定的服务通信密钥，保持普通、单链接、0600、容器 UID 33 所有；`ca.pem` 是验证应用 PHP HTTPS 接口的 CA 文件，保持普通、单链接、不可被组或其他用户写入。程序继续校验密钥、CA 文件及 CA 摘要。两者只读挂载到容器内 `/run/peanut-collaboration`，不挂载应用源码、数据库凭据或应用票据密钥。
 
-应用原生配置入口可按已授权固定配置准备本服务自己的相对路径配置；应用用于定位独立服务仓库的外部 `service_root` 属于应用部署合同，不能据此放宽本服务的仓内路径边界。stop 额外要求原始容器身份与 PHP 已确认的持久排空回执（有界 base64 JSON），再核对同一容器实际停止且退出码为 0。它不强杀、不删卷、不替应用执行授权或修改业务数据；最终 stopped 由应用消费原始签名停止证明后确认。
+配置和文件准备完成后，使用标准 Compose 命令：
 
-程序构建、容器健康与应用允许接纳编辑分别记录。服务启动后先完成 PHP/Node 配对，应用明确激活后才接纳编辑；停止须沿用原排空身份、实际持久确认和精确容器停止证明，未知结果先对账。目录调整不重做已成功的旧排空，不重置测试授权或失败预算。源码检查与构建不能代替双人编辑、保存和重新打开的真实验收。
+```sh
+docker compose config --quiet
+docker compose up -d
+docker compose ps
+docker compose logs -f collaboration
+```
+
+服务通过 `.env` 指定的 Docker 网络访问应用 PHP API。当前 Compose 不发布宿主机端口，浏览器的 WSS 入口由应用已有的 TLS 反向代理提供；需要从宿主机直连时须明确配置端口映射，不能把容器监听地址当作宿主机访问地址。
+
+程序启动后自动通过 API 校验应用身份和配置，应用按原协议激活编辑接纳。容器启动、健康检查和实际编辑保存分别记录，源码构建不能代替双人编辑、保存和重新打开的真实验收。
+
+应用托管的实例继续通过应用生命周期入口执行停止：先关闭编辑接纳并取得持久排空回执，再由应用调用 Compose 停止同一容器，并核验原容器身份、退出状态及签名停止证明。该流程在应用端，不再依赖本仓库的 Python 包装脚本。原有成功排空、未决请求、失败预算和实例身份均保留；不要用强杀或删卷替代未完成的持久保存。非托管维护需要等待 Node 的 SIGTERM 排空时，使用 `docker compose stop --timeout -1 collaboration`，保存失败或状态未知时先对账，不将停止观察当作业务保存成功。
