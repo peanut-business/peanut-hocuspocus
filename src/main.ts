@@ -25,10 +25,12 @@ if (
   throw new Error('SERVICE_CERTIFICATE_DIRECTORY_INVALID');
 const secretPath = required('COLLABORATION_SECRET_FILE');
 const stat = lstatSync(secretPath);
+const repositorySecret = lstatSync(repositoryCerts + '/service-secret');
 if (
   secretPath !== '/run/peanut-collaboration/service-secret' ||
   realpathSync(secretPath) !== secretPath ||
   !stat.isFile() ||
+  stat.dev !== repositorySecret.dev || stat.ino !== repositorySecret.ino ||
   stat.nlink !== 1 ||
   (stat.mode & 0o777) !== 0o600 ||
   stat.uid !== process.getuid?.() ||
@@ -44,10 +46,12 @@ if (secret.length < 32 || /[\r\n\0]/.test(secret))
   throw new Error('SERVICE_SECRET_INVALID');
 const caPath = '/run/peanut-collaboration/ca.pem',
   caStat = lstatSync(caPath);
+const repositoryCa = lstatSync(repositoryCerts + '/ca.pem');
 if (
   process.env.NODE_EXTRA_CA_CERTS !== caPath ||
   realpathSync(caPath) !== caPath ||
   !caStat.isFile() ||
+  caStat.dev !== repositoryCa.dev || caStat.ino !== repositoryCa.ino ||
   caStat.nlink !== 1 ||
   (caStat.mode & 0o022) !== 0 ||
   caStat.size < 1 ||
