@@ -32,10 +32,8 @@ import {
 import {
   Control,
   controlPath,
-  operatorPath,
   accessPath,
   type ControlInput,
-  type OperatorInput,
 } from './business-control.js';
 
 interface Context {
@@ -141,20 +139,9 @@ export class CollaborationRuntime {
   private readonly invalidationResults = new Map<string, AccessInvalidationAck>();
   private maintenance: ReturnType<typeof setInterval> | undefined;
   private stopping = false;
-  private admissionOpen = false;
-  private readonly probeId = randomUUID();
-  private activationId: string | null = null;
-  private processLeaseExpires = 0;
-  private lifecycleState: Record<string, unknown> | undefined;
-  private lifecycleTimer: ReturnType<typeof setInterval> | undefined;
-  private lifecyclePending: Promise<Record<string, unknown>> | undefined;
-  private instanceDrain:
-    | {
-        input: OperatorInput;
-        pending?: Promise<Record<string, unknown>>;
-        result?: Record<string, unknown>;
-      }
-    | undefined;
+  private readonly sockets = new Set<import('node:net').Socket>();
+  private upgradeWindow = 0;
+  private upgradeCount = 0;
 
   constructor(
     readonly php: PhpClient,
@@ -166,7 +153,6 @@ export class CollaborationRuntime {
     this.control = new Control(
       php,
       (input) => this.controlRoom(input),
-      (input) => this.operator(input),
       async (input) => this.invalidateAccess(input)
     );
     this.server = new Server<Context>({
@@ -177,22 +163,33 @@ export class CollaborationRuntime {
       debounce: 2000,
       maxDebounce: 10000,
       timeout: 30000,
+      maxUnauthenticatedQueueSize: 1048576,
+      maxUnauthenticatedQueueMessages: 128,
+      maxPendingDocuments: 8,
       unloadImmediately: false,
       yDocOptions: { gc: false, gcFilter: () => true },
       websocketOptions: { maxPayload: 4200000 },
+      onUpgrade: async ({ socket }) => {
+        const now = Date.now();
+        if (now - this.upgradeWindow >= 1000) {
+          this.upgradeWindow = now;
+          this.upgradeCount = 0;
+        }
+        if (this.stopping || this.sockets.size >= 1000 || ++this.upgradeCount > 100) {
+          // Hocuspocus's async upgrade listener rethrows truthy hook errors.
+          // Reject only this socket; its empty sentinel stops the upgrade safely.
+          socket.destroy();
+          throw undefined;
+        }
+        this.sockets.add(socket);
+        socket.once('close', () => this.sockets.delete(socket));
+      },
       onConnect: async () => {
-        if (
-          this.stopping ||
-          !this.admissionOpen ||
-          this.processLeaseExpires <= Date.now()
-        )
-          throw new Error('SERVICE_NOT_ACTIVE');
+        if (this.stopping) throw new Error('SERVICE_STOPPING');
       },
       onAuthenticate: async (payload) => {
         if (
           this.stopping ||
-          !this.admissionOpen ||
-          this.processLeaseExpires <= Date.now() ||
           !payload.token ||
           payload.token.length > 8192 ||
           (this.states.size >= 1000 && !this.states.has(payload.documentName))
@@ -204,12 +201,7 @@ export class CollaborationRuntime {
         } catch (error) {
           throw new Error(this.code(error));
         }
-        if (
-          this.stopping ||
-          !this.admissionOpen ||
-          this.processLeaseExpires <= Date.now()
-        )
-          throw new Error('SERVICE_NOT_ACTIVE');
+        if (this.stopping) throw new Error('SERVICE_STOPPING');
         assertAuth(
           auth,
           payload.documentName,
@@ -475,27 +467,20 @@ export class CollaborationRuntime {
         }
       },
       onRequest: async (payload) => {
-        if (
-          payload.request.url === '/ready' &&
-          payload.request.method === 'GET'
-        ) {
-          const ready =
-            this.lifecycleState?.php_ready === true &&
-            this.processLeaseExpires > Date.now() &&
-            !this.stopping;
-          payload.response.writeHead(ready ? 200 : 503, {
-            'Content-Type': 'application/json',
-          });
-          payload.response.end(
-            JSON.stringify({
-              ready,
-              admission_enabled: ready && this.admissionOpen,
-              native_protocol: 2,
-            })
+        if (['/live', '/ready'].includes(payload.request.url ?? '') &&
+          payload.request.method === 'GET') {
+          const dependency = this.php.dependencyState();
+          const ready = !this.stopping && dependency === 'available';
+          payload.response.writeHead(
+            payload.request.url === '/live' ? (this.stopping ? 503 : 200) : (ready ? 200 : 503),
+            { 'Content-Type': 'application/json' }
           );
+          payload.response.end(JSON.stringify({
+            listening: !this.stopping, ready, backend: dependency, native_protocol: 2,
+          }));
           throw undefined;
         }
-        if ([controlPath, operatorPath, accessPath].includes(payload.request.url ?? '')) {
+        if ([controlPath, accessPath].includes(payload.request.url ?? '')) {
           await this.control.handle(payload.request, payload.response);
           throw undefined;
         }
@@ -524,7 +509,7 @@ export class CollaborationRuntime {
     name: string
   ): Promise<ConnectionAuth> {
     try {
-      return await this.php.call<ConnectionAuth>('authorize', { ticket });
+      return await this.php.call<ConnectionAuth>('authorize', { token: ticket, document_name: name });
     } catch (error) {
       if (
         !(error instanceof PhpFailure) ||
@@ -592,7 +577,7 @@ export class CollaborationRuntime {
       if (this.stopping) throw new Error('SERVICE_DRAINING');
       // Exactly one reauthorization of the original, still-unconsumed ticket.
       // A further recovery requirement is returned to the caller, never looped.
-      const auth = await this.php.call<ConnectionAuth>('authorize', { ticket });
+      const auth = await this.php.call<ConnectionAuth>('authorize', { token: ticket, document_name: name });
       assertAuth(auth, name, this.php.config.instanceId, this.php.holderKey);
       if (
         auth.room_key !== recovered.room_key ||
@@ -690,8 +675,6 @@ export class CollaborationRuntime {
     if (
       write &&
       (this.stopping ||
-        !this.admissionOpen ||
-        this.processLeaseExpires <= Date.now() ||
         state.blocked ||
         this.fences.get(auth.room_key)?.active ||
         connection.readOnly ||
@@ -1215,332 +1198,6 @@ export class CollaborationRuntime {
     return committed;
   }
 
-  private lifecycleIdentity(): Record<string, unknown> {
-    const c = this.php.config;
-    if (
-      !c.edition ||
-      !['engine', 'standalone', 'multi-tenant'].includes(c.edition) ||
-      !Number.isSafeInteger(c.configRevision) ||
-      Number(c.configRevision) < 1 ||
-      !digest(c.configSha256)
-    )
-      throw new Error('LIFECYCLE_CONFIGURATION_INVALID');
-    return {
-      instance_id: c.instanceId,
-      edition: c.edition,
-      service_instance_id: c.serviceInstanceId,
-      config_revision: c.configRevision,
-      config_sha256: c.configSha256,
-      projector_version: projectorVersion,
-    };
-  }
-  private async pairedProbe(full: boolean): Promise<Record<string, unknown>> {
-    if (this.lifecyclePending) {
-      const previous = await this.lifecyclePending;
-      if (!full) return previous;
-    }
-    const pending = this.php
-      .call<Record<string, unknown>>('lifecycle', {
-        stage: 'paired_start',
-        probe_id: this.probeId,
-        full,
-        ...this.lifecycleIdentity(),
-      })
-      .then((value) => {
-        this.validateLifecycle(value);
-        this.lifecycleState = value;
-        this.processLeaseExpires = Number(value.process_lease_expires_at_ms);
-        // Admission follows only the authenticated backend's committed pairing
-        // of this exact process/configuration. An outstanding drain stays closed.
-        const activation = value.activation_id;
-        if (
-          !this.stopping && !this.instanceDrain && value.phase === 'active' &&
-          value.admission_enabled === true && typeof activation === 'string' &&
-          requestId(activation) &&
-          (this.activationId === null || this.activationId === activation)
-        ) {
-          this.activationId = activation;
-          this.admissionOpen = true;
-        } else {
-          this.admissionOpen = false;
-        }
-        return value;
-      });
-    this.lifecyclePending = pending;
-    try {
-      return await pending;
-    } finally {
-      if (this.lifecyclePending === pending) this.lifecyclePending = undefined;
-    }
-  }
-  private validateLifecycle(value: Record<string, unknown>): void {
-    if (
-      !value ||
-      value.native_protocol !== 2 ||
-      value.php_ready !== true ||
-      value.holder_key !== this.php.holderKey ||
-      value.probe_id !== this.probeId ||
-      !Number.isSafeInteger(value.process_lease_expires_at_ms) ||
-      Number(value.process_lease_expires_at_ms) <= Date.now() ||
-      Number(value.process_lease_expires_at_ms) > Date.now() + 120000 ||
-      !['prepared', 'active', 'draining', 'durably_drained'].includes(
-        String(value.phase)
-      ) ||
-      Object.entries(this.lifecycleIdentity()).some(
-        ([key, expected]) => value[key] !== expected
-      )
-    )
-      throw new Error('PHP_LIFECYCLE_BINDING_INVALID');
-  }
-  startLifecycle(): void {
-    if (this.lifecycleTimer) throw new Error('LIFECYCLE_ALREADY_STARTED');
-    const refresh = (full: boolean) => {
-      if (this.stopping || this.instanceDrain) return;
-      void this.pairedProbe(full).catch(() => {
-        if (this.processLeaseExpires <= Date.now()) {
-          this.admissionOpen = false;
-          this.states.forEach((state) =>
-            state.document
-              ?.getConnections()
-              .forEach((connection) =>
-                this.connectionError(connection, 'PROCESS_LEASE_UNCONFIRMED')
-              )
-          );
-        }
-      });
-    };
-    refresh(true);
-    this.lifecycleTimer = setInterval(() => refresh(false), 10000);
-    this.lifecycleTimer.unref();
-  }
-  private async operator(
-    input: OperatorInput
-  ): Promise<Record<string, unknown>> {
-    const commonKeys =
-      'action,activation_id,config_revision,config_sha256,edition,holder_key,instance_id,probe_id,projector_version,protocol,service_instance_id';
-    const expectedKeys =
-      input.action === 'drain_instance'
-        ? 'action,activation_id,config_revision,config_sha256,drain_id,edition,holder_key,instance_id,owner_container,plan_sha256,probe_id,projector_version,protocol,rooms,service_instance_id'
-        : commonKeys;
-    if (
-      Object.keys(input).sort().join(',') !== expectedKeys ||
-      input.protocol !== 2 ||
-      input.holder_key !== this.php.holderKey ||
-      input.probe_id !== this.probeId ||
-      !['probe', 'activate', 'drain_instance'].includes(input.action) ||
-      (input.activation_id !== null && !requestId(input.activation_id)) ||
-      Object.entries(this.lifecycleIdentity()).some(
-        ([key, expected]) => input[key as keyof OperatorInput] !== expected
-      )
-    )
-      throw new Error('OPERATOR_INPUT_INVALID');
-    if (input.action === 'drain_instance') return this.drainInstance(input);
-    const php =
-      input.action === 'probe'
-        ? await this.pairedProbe(true)
-        : await this.php.call<Record<string, unknown>>('lifecycle', {
-            stage: 'activation_state',
-            probe_id: this.probeId,
-            activation_id: input.activation_id,
-          });
-    this.validateLifecycle(php);
-    this.lifecycleState = php;
-    this.processLeaseExpires = Number(php.process_lease_expires_at_ms);
-    if (input.action === 'activate') {
-      if (
-        this.stopping ||
-        this.instanceDrain ||
-        !input.activation_id ||
-        php.phase !== 'active' ||
-        php.activation_id !== input.activation_id
-      )
-        throw new Error('ACTIVATION_UNCONFIRMED');
-      this.activationId = input.activation_id;
-      this.admissionOpen = true;
-    }
-    return {
-      ...php,
-      node_ready: !this.stopping,
-      paired_ready: !this.stopping && php.php_ready === true,
-      admission_enabled:
-        php.phase === 'active' &&
-        this.admissionOpen &&
-        this.processLeaseExpires > Date.now(),
-    };
-  }
-  private lifecycleHash(value: unknown): string {
-    return sha(phpJson(value).replace(/\\\//g, '/'));
-  }
-  private async drainInstance(
-    input: OperatorInput
-  ): Promise<Record<string, unknown>> {
-    if (
-      !requestId(input.drain_id) ||
-      !digest(input.plan_sha256) ||
-      !input.owner_container ||
-      typeof input.owner_container !== 'object' ||
-      Array.isArray(input.owner_container) ||
-      !Array.isArray(input.rooms) ||
-      input.rooms.length > 10000
-    )
-      throw new Error('INSTANCE_DRAIN_PLAN_INVALID');
-    const {
-      action: _action,
-      protocol: _protocol,
-      plan_sha256: _hash,
-      ...plan
-    } = input;
-    if (this.lifecycleHash(plan) !== input.plan_sha256)
-      throw new Error('INSTANCE_DRAIN_PLAN_INVALID');
-    const keys = new Set<string>();
-    for (const room of input.rooms) {
-      if (
-        !room ||
-        Object.keys(room).sort().join(',') !==
-          'document_id,holder_key,lease_epoch,room_key' ||
-        !digest(room.room_key) ||
-        keys.has(room.room_key) ||
-        !Number.isSafeInteger(room.document_id) ||
-        room.document_id < 1 ||
-        !Number.isSafeInteger(room.lease_epoch) ||
-        room.lease_epoch < 1 ||
-        (room.holder_key !== null &&
-          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
-            room.holder_key
-          ))
-      )
-        throw new Error('INSTANCE_DRAIN_PLAN_INVALID');
-      keys.add(room.room_key);
-    }
-    if (
-      this.instanceDrain &&
-      phpJson(this.instanceDrain.input) !== phpJson(input)
-    )
-      throw new Error('ORIGINAL_INSTANCE_DRAIN_REQUIRED');
-    if (!this.instanceDrain)
-      this.instanceDrain = {
-        input: JSON.parse(JSON.stringify(input)) as OperatorInput,
-      };
-    const attempt = this.instanceDrain;
-    if (attempt.result) return attempt.result;
-    if (attempt.pending) return attempt.pending;
-    this.admissionOpen = false;
-    this.stopping = true;
-    if (this.maintenance) clearInterval(this.maintenance);
-    this.maintenance = undefined;
-    if (this.lifecycleTimer) clearInterval(this.lifecycleTimer);
-    this.lifecycleTimer = undefined;
-    const pending = (async () => {
-      const php = await this.php.call<Record<string, unknown>>('lifecycle', {
-        stage: 'drain_state',
-        probe_id: this.probeId,
-        drain_id: input.drain_id,
-        plan_sha256: input.plan_sha256,
-      });
-      this.validateLifecycle(php);
-      if (
-        php.phase !== 'draining' ||
-        php.drain_id !== input.drain_id ||
-        php.plan_sha256 !== input.plan_sha256 ||
-        php.activation_id !== input.activation_id
-      )
-        throw new Error('INSTANCE_DRAIN_FENCE_UNCONFIRMED');
-      await Promise.all([...this.server.hocuspocus.loadingDocuments.values()]);
-      const documents = [...this.server.hocuspocus.documents.values()];
-      documents.forEach((document) =>
-        document.getConnections().forEach((connection) => {
-          connection.readOnly = true;
-        })
-      );
-      await Promise.all(
-        documents.flatMap((document) =>
-          document
-            .getConnections()
-            .map((connection) => connection.waitForPendingMessages())
-        )
-      );
-      await Promise.allSettled([...this.actions]);
-      const receipts: Record<string, unknown>[] = [];
-      for (const state of this.states.values()) {
-        const expected = input.rooms?.find(
-          (room) => room.room_key === state.auth.room_key
-        );
-        if (
-          !expected ||
-          expected.document_id !== state.auth.document_id ||
-          expected.lease_epoch !== state.auth.lease_epoch ||
-          expected.holder_key !== this.php.holderKey
-        )
-          throw new Error('INSTANCE_DRAIN_SCOPE_CHANGED');
-      }
-      for (const room of input.rooms ?? []) {
-        const state = [...this.states.values()].find(
-          (value) => value.auth.room_key === room.room_key
-        );
-        if (!state) {
-          receipts.push({ ...room, source: 'offline' });
-          continue;
-        }
-        const document = state.document;
-        if (!document || document.isDestroyed || document.isLoading)
-          throw new Error('INSTANCE_DRAIN_LOAD_UNCONFIRMED');
-        const captured = this.fixedContent(document, state.progress);
-        await this.flushDocument(document);
-        if (state.dirty || state.capture) await this.flushDocument(document);
-        const stored = state.stored;
-        if (
-          !stored ||
-          !stored.hasReceipt ||
-          state.capture ||
-          state.dirty ||
-          !Y.snapshotContainsUpdate(stored.snapshot, captured.bytes) ||
-          !Y.equalDeleteSets(
-            stored.snapshot.ds,
-            Y.mergeDeleteSets([stored.snapshot.ds, captured.snapshot.ds])
-          )
-        )
-          throw new Error('INSTANCE_DRAIN_STORE_UNCONFIRMED');
-        receipts.push({
-          ...room,
-          source: 'native',
-          store_id: stored.proof.captureId,
-          state_seq: stored.proof.stateSeq,
-          binary_sha256: stored.proof.binarySha256,
-          target_progress: stored.progress,
-          coverage: {
-            algorithm: 'yjs.snapshotContainsUpdate/13.6.32',
-            covers_target: true,
-            committed_snapshot_sha256: sha(
-              new Uint8Array(Buffer.from(stored.proof.snapshotBase64, 'base64'))
-            ),
-            captured_snapshot_sha256: sha(Y.encodeSnapshot(captured.snapshot)),
-          },
-        });
-      }
-      const result = {
-        ...this.lifecycleIdentity(),
-        native_protocol: 2,
-        holder_key: this.php.holderKey,
-        probe_id: this.probeId,
-        activation_id: input.activation_id,
-        drain_id: input.drain_id,
-        plan_sha256: input.plan_sha256,
-        native_drained: true,
-        phase: 'draining',
-        admission_enabled: false,
-        room_receipts: receipts,
-        targets_sha256: this.lifecycleHash(receipts),
-      };
-      attempt.result = result;
-      return result;
-    })();
-    attempt.pending = pending;
-    try {
-      return await pending;
-    } finally {
-      if (attempt.pending === pending) delete attempt.pending;
-    }
-  }
   startMaintenance(): void {
     if (this.maintenance) throw new Error('MAINTENANCE_ALREADY_STARTED');
     this.maintenance = setInterval(() => {
@@ -1637,15 +1294,11 @@ export class CollaborationRuntime {
   }
 
   private assertInvalidationHolder(input: AccessInvalidationInput): void {
-    const state = this.lifecycleState;
     if (input.instance_id !== this.php.config.instanceId
       || input.service_instance_id !== this.php.config.serviceInstanceId
-      || input.holder_key !== this.php.holderKey || !state
-      || !['active', 'draining'].includes(String(state.phase))
-      || this.processLeaseExpires <= Date.now()) {
+      || input.holder_key !== this.php.holderKey) {
       throw new Error('ACCESS_INVALIDATION_HOLDER_UNCONFIRMED');
     }
-    this.validateLifecycle(state);
   }
 
   /** Synchronous mark/close critical section: no await can interleave grant renewal or ACK publication. */
@@ -1960,9 +1613,6 @@ export class CollaborationRuntime {
 
   async drain(): Promise<void> {
     this.stopping = true;
-    this.admissionOpen = false;
-    if (this.lifecycleTimer) clearInterval(this.lifecycleTimer);
-    this.lifecycleTimer = undefined;
     if (this.maintenance) clearInterval(this.maintenance);
     this.maintenance = undefined;
     await Promise.allSettled([

@@ -12,9 +12,7 @@ export interface ServiceConfig {
   keyId: string;
   secret: string;
   timeoutMs: number;
-  edition?: string;
-  configRevision?: number;
-  configSha256?: string;
+  edition: string;
 }
 export type Endpoint =
   | 'authorize'
@@ -24,7 +22,6 @@ export type Endpoint =
   | 'receipt'
   | 'references'
   | 'recovery'
-  | 'lifecycle'
   | 'target/prepare'
   | 'target';
 export class PhpFailure extends Error {
@@ -38,6 +35,14 @@ export class PhpFailure extends Error {
 }
 export class PhpClient {
   readonly holderKey = randomUUID();
+  private lastBackendResponse = 0;
+  private backendAvailable = false;
+
+  dependencyState(): 'unconfirmed' | 'available' | 'unavailable' {
+    if (!this.lastBackendResponse || Date.now() - this.lastBackendResponse > 60000)
+      return 'unconfirmed';
+    return this.backendAvailable ? 'available' : 'unavailable';
+  }
 
   constructor(
     readonly config: ServiceConfig,
@@ -58,6 +63,7 @@ export class PhpClient {
         (s) => !/^[A-Za-z0-9_-]{1,128}$/.test(s)
       ) ||
       Buffer.byteLength(config.secret) < 32 ||
+      !['engine', 'standalone', 'multi-tenant'].includes(config.edition) ||
       !Number.isSafeInteger(config.timeoutMs) ||
       config.timeoutMs < 100 ||
       config.timeoutMs > 30000
@@ -65,6 +71,19 @@ export class PhpClient {
       throw new Error('SERVICE_CONFIG_INVALID');
   }
   async call<T>(endpoint: Endpoint, input: unknown): Promise<T> {
+    try {
+      const value = await this.request<T>(endpoint, input);
+      this.backendAvailable = true;
+      this.lastBackendResponse = Date.now();
+      return value;
+    } catch (error) {
+      // A signed business rejection still proves backend transport availability.
+      this.backendAvailable = error instanceof PhpFailure;
+      this.lastBackendResponse = Date.now();
+      throw error;
+    }
+  }
+  private async request<T>(endpoint: Endpoint, input: unknown): Promise<T> {
     const path = '/adminapi/internal/collaboration/v1/' + endpoint;
     const raw = JSON.stringify(input);
     if (Buffer.byteLength(raw) > 8388608)

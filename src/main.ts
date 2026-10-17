@@ -23,27 +23,12 @@ if (
   (repositoryDirectory.mode & 0o022) !== 0
 )
   throw new Error('SERVICE_CERTIFICATE_DIRECTORY_INVALID');
-const secretPath = required('COLLABORATION_SECRET_FILE');
-const stat = lstatSync(secretPath);
-const repositorySecret = lstatSync(repositoryCerts + '/service-secret');
-if (
-  secretPath !== '/run/peanut-collaboration/service-secret' ||
-  realpathSync(secretPath) !== secretPath ||
-  !stat.isFile() ||
-  stat.dev !== repositorySecret.dev || stat.ino !== repositorySecret.ino ||
-  stat.nlink !== 1 ||
-  (stat.mode & 0o777) !== 0o600 ||
-  stat.uid !== process.getuid?.() ||
-  stat.size < 32 ||
-  stat.size > 4096 ||
-  process.env.COLLABORATION_SECRET ||
-  process.env.COLLABORATION_TICKET_SECRET ||
-  process.env.DB_HOST
-)
-  throw new Error('SERVICE_SECRET_REFERENCE_INVALID');
-const secret = readFileSync(secretPath, 'utf8').trim();
-if (secret.length < 32 || /[\r\n\0]/.test(secret))
+// The service key authenticates backend traffic; it is never a user token.
+const secret = required('COLLABORATION_SECRET');
+if (Buffer.byteLength(secret) < 32 || Buffer.byteLength(secret) > 4096 || /[\r\n\0]/.test(secret))
   throw new Error('SERVICE_SECRET_INVALID');
+if (process.env.COLLABORATION_TICKET_SECRET || process.env.DB_HOST)
+  throw new Error('SERVICE_CONFIGURATION_INVALID');
 const caPath = '/run/peanut-collaboration/ca.pem',
   caStat = lstatSync(caPath);
 const repositoryCa = lstatSync(repositoryCerts + '/ca.pem');
@@ -69,8 +54,6 @@ const runtime = new CollaborationRuntime(
     keyId: required('COLLABORATION_KEY_ID'),
     secret,
     edition: required('COLLABORATION_EDITION'),
-    configRevision: Number(required('COLLABORATION_CONFIG_REVISION')),
-    configSha256: required('COLLABORATION_CONFIG_SHA256'),
     timeoutMs: Number(required('COLLABORATION_PHP_TIMEOUT_MS')),
   }),
   required('COLLABORATION_LISTEN_ADDRESS'),
@@ -78,7 +61,6 @@ const runtime = new CollaborationRuntime(
 );
 await runtime.server.listen();
 runtime.startMaintenance();
-runtime.startLifecycle();
 let draining = false;
 for (const signal of ['SIGTERM', 'SIGINT'] as const)
   process.on(signal, () => {

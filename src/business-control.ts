@@ -11,7 +11,6 @@ import { sha } from './digests.js';
 
 export const controlPath =
   '/internal/collaboration/control/v1/business-barrier';
-export const operatorPath = '/internal/collaboration/operator/v1/lifecycle';
 export const accessPath = '/internal/collaboration/access/v1/invalidate';
 export interface ControlInput {
   protocol: 2;
@@ -24,29 +23,6 @@ export interface ControlInput {
   result_epoch?: number;
   status?: 'active' | 'archived' | 'blocked_recovery';
 }
-export interface OperatorInput {
-  protocol: 2;
-  action: 'probe' | 'activate' | 'drain_instance';
-  holder_key: string;
-  probe_id: string;
-  activation_id: string | null;
-  instance_id: string;
-  edition: string;
-  service_instance_id: string;
-  config_revision: number;
-  config_sha256: string;
-  projector_version: string;
-  drain_id?: string;
-  plan_sha256?: string;
-  rooms?: {
-    room_key: string;
-    document_id: number;
-    lease_epoch: number;
-    holder_key: string | null;
-  }[];
-  owner_container?: Record<string, unknown>;
-}
-
 /** Existing service HMAC transport, with the native protocol-2 per-room body. */
 export class Control {
   private readonly nonces = new Map<string, number>();
@@ -54,9 +30,6 @@ export class Control {
     private readonly php: PhpClient,
     private readonly execute: (
       input: ControlInput
-    ) => Promise<Record<string, unknown>>,
-    private readonly operator: (
-      input: OperatorInput
     ) => Promise<Record<string, unknown>>,
     private readonly invalidate: (
       input: AccessInvalidationInput
@@ -68,10 +41,8 @@ export class Control {
     response: ServerResponse
   ): Promise<void> {
     const config = this.php.config;
-    const path = request.url === accessPath ? accessPath
-      : request.url === operatorPath ? operatorPath : controlPath;
-    const domain = path === accessPath ? 'access-invalidation-v1'
-      : path === operatorPath ? 'operator' : 'control';
+    const path = request.url === accessPath ? accessPath : controlPath;
+    const domain = path === accessPath ? 'access-invalidation-v1' : 'control';
     const protocol = path === accessPath ? '1' : '2';
     let nonce = '',
       holderKey = '',
@@ -132,7 +103,7 @@ export class Control {
       for await (const part of request) {
         const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
         length += chunk.length;
-        if (length > (domain === 'operator' ? 8388608 : 65536))
+        if (length > 65536)
           throw new Error('CONTROL_REQUEST_TOO_LARGE');
         chunks.push(new Uint8Array(chunk));
       }
@@ -172,19 +143,6 @@ export class Control {
           throw new Error('ACCESS_INVALIDATION_HOLDER_CHANGED');
         }
         result = { ok: true, data: await this.invalidate(input) };
-        status = 200;
-      } else if (domain === 'operator') {
-        if (
-          !input ||
-          input.protocol !== 2 ||
-          input.holder_key !== holderKey ||
-          holderKey !== this.php.holderKey
-        )
-          throw new Error('CONTROL_HOLDER_CHANGED');
-        result = {
-          ok: true,
-          data: await this.operator(input as OperatorInput),
-        };
         status = 200;
       } else {
         const roomInput = input as ControlInput;
