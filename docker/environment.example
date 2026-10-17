@@ -1,6 +1,8 @@
-# Save the instance-specific file outside tracked source; no default host/port/network.
+# Copy to private/docker.env (0600). All host paths are relative to this
+# repository root, not cwd or docker/. No absolute paths, .. or symlink paths.
+# service.py validates and resolves them for Compose; no host/port/network defaults.
 COMPOSE_PROJECT_NAME=
-COLLABORATION_PROGRAM_ROOT=
-COLLABORATION_SECRET_DIRECTORY=
-COLLABORATION_RUNTIME_ENV_FILE=
+COLLABORATION_PROGRAM_ROOT=.
+COLLABORATION_SECRET_DIRECTORY=private/collaboration/service
+COLLABORATION_RUNTIME_ENV_FILE=private/runtime.env
 COLLABORATION_NETWORK=

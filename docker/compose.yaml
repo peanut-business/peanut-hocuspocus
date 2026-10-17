@@ -9,6 +9,8 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs: ["/tmp:rw,noexec,nosuid,size=1m"]
+    # service.py anchors repository-relative config to its real source root
+    # before interpolation. Use that owner entry, not raw docker compose up.
     env_file: ["${COLLABORATION_RUNTIME_ENV_FILE:?explicit service configuration required}"]
     environment:
       COLLABORATION_SECRET_FILE: /run/peanut-collaboration/service-secret
@@ -18,10 +20,14 @@ services:
         source: ${COLLABORATION_PROGRAM_ROOT:?explicit fixed program required}
         target: /srv/peanut-hocuspocus
         read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ${COLLABORATION_SECRET_DIRECTORY:?explicit service secret references required}
         target: /run/peanut-collaboration
         read_only: true
+        bind:
+          create_host_path: false
     networks:
       service:
         aliases: [collaboration]

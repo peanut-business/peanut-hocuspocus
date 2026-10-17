@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -11,6 +12,15 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = 'node:22.23.2-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9'
+
+
+def repository_path(value):
+    if not value or Path(value).is_absolute() or '..' in Path(value).parts:
+        raise ValueError('SERVICE_REPOSITORY_PATH_REQUIRED')
+    path = ROOT / value
+    if path.resolve() != path:
+        raise ValueError('SERVICE_REPOSITORY_PATH_REQUIRED')
+    return path
 
 
 def environment(path):
@@ -38,11 +48,14 @@ def decode(value):
 
 
 def execute(args):
-    values = environment(args.environment)
+    environment_path = repository_path(str(args.environment))
+    values = environment(environment_path)
     expected = {'COLLABORATION_PROGRAM_ROOT': str(ROOT),
                 'COLLABORATION_SECRET_DIRECTORY': str(ROOT / 'private/collaboration/service'),
                 'COLLABORATION_RUNTIME_ENV_FILE': str(ROOT / 'private/runtime.env')}
-    if any(values.get(key) != value for key, value in expected.items()) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', values.get('COMPOSE_PROJECT_NAME', '')):
+    if any(str(repository_path(values.get(key))) != value for key, value in expected.items()) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', values.get('COMPOSE_PROJECT_NAME', '')):
+        raise ValueError('SERVICE_OWNER_BINDING_INVALID')
+    if not Path(expected['COLLABORATION_SECRET_DIRECTORY']).is_dir():
         raise ValueError('SERVICE_OWNER_BINDING_INVALID')
     if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}', values.get('COLLABORATION_NETWORK', '')):
         raise ValueError('SERVICE_INTERFACE_NETWORK_INVALID')
@@ -54,10 +67,16 @@ def execute(args):
     docker = shutil.which('docker')
     if docker is None:
         raise ValueError('SERVICE_DOCKER_UNAVAILABLE')
-    compose = [docker, 'compose', '--env-file', str(args.environment), '-f', str(ROOT / 'docker/compose.yaml')]
+    # Compose resolves relative inputs from docker/, not from the repository.
+    # Normalize only the validated inputs for this child; never rewrite config.
+    compose_environment = os.environ.copy()
+    compose_environment.update(expected)
+    for key in ('COMPOSE_PROJECT_NAME', 'COLLABORATION_NETWORK'):
+        compose_environment[key] = values[key]
+    compose = [docker, 'compose', '--env-file', str(environment_path), '-f', str(ROOT / 'docker/compose.yaml')]
 
     def run(command, timeout=40):
-        result = subprocess.run(command, cwd=ROOT / 'docker', stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        result = subprocess.run(command, cwd=ROOT / 'docker', env=compose_environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
         if result.returncode:
             raise RuntimeError('SERVICE_NATIVE_EFFECT_UNCONFIRMED')
         return result.stdout.decode()
@@ -109,7 +128,7 @@ def execute(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('start', 'status', 'stop'))
-    parser.add_argument('--environment', type=Path, required=True)
+    parser.add_argument('--environment', type=Path, required=True, help='0600 configuration file relative to this repository root, independent of cwd')
     parser.add_argument('--durable-receipt')
     parser.add_argument('--original-container')
     try:

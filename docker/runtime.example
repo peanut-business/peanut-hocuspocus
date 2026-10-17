@@ -1,5 +1,7 @@
 # Values must match the application's fixed, authorized service configuration.
+# Copy to private/runtime.env (0600); these are identities/endpoints, not host paths.
 # Keep service-secret (0600, UID 33) and ca.pem as private readonly file references.
+# /run/peanut-collaboration paths are fixed container paths supplied by Compose.
 COLLABORATION_PHP_ORIGIN=
 COLLABORATION_INSTANCE_ID=
 COLLABORATION_SERVICE_INSTANCE_ID=
