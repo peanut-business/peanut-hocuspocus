@@ -8,14 +8,15 @@
 
 `pnpm install --frozen-lockfile --ignore-scripts` 准备本项目自己的依赖；`pnpm build` 编译本项目源码，`pnpm check` 单独检查未构建的源码。构建已经完成类型检查时不重复运行 check。Node 固定为 22.23.2，pnpm 固定为 9.15.6，不从应用工作树复制 node_modules。
 
-仓库根目录的 `compose.yaml` 使用固定 Node 镜像，只读挂载本仓库的程序和依赖。运行配置统一放根目录 `.env`；各参数已在 `.env.example` 中用中文逐项说明，配置里不需要填写任何宿主机文件路径。Compose 按自身文件位置解析固定的相对挂载路径，克隆到其他目录无需修改路径。
+`docker/compose.yaml` 使用固定 Node 镜像，通过本地目录绑定挂载本仓库程序和依赖，不创建 Docker 命名数据卷。运行配置统一放 `docker/.env`，证书和认证密钥放同级的 `certs/`。路径在 Compose 中固定为仓库内相对路径，克隆到其他目录无需修改。
 
 在仓库根目录准备配置并构建：
 
 ```sh
-cp .env.example .env
-chmod 600 .env
-# 编辑 .env，填写应用接口、身份、配置摘要、端口和已有 Docker 网络。
+cp docker/.env.example docker/.env
+chmod 600 docker/.env
+mkdir -p certs
+# 编辑 docker/.env，填写宿主机端口、应用接口和已有 Docker 网络，导入应用给出的身份与摘要。
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm build
 ```
@@ -23,23 +24,30 @@ pnpm build
 私密文件只放在本服务自己的目录中，不提交到 Git：
 
 ```text
-private/collaboration/service/
+certs/
 ├── service-secret
 └── ca.pem
 ```
 
-`service-secret` 使用与应用约定的服务通信密钥，保持普通、单链接、0600、容器 UID 33 所有；`ca.pem` 是验证应用 PHP HTTPS 接口的 CA 文件，保持普通、单链接、不可被组或其他用户写入。程序继续校验密钥、CA 文件及 CA 摘要。两者只读挂载到容器内 `/run/peanut-collaboration`，不挂载应用源码、数据库凭据或应用票据密钥。
+`service-secret` 是 API 通信认证密钥，不是 TLS 私钥；保持普通、单链接、0600、容器 UID 33 所有。`ca.pem` 用于验证应用 PHP HTTPS 接口，保持普通、单链接、不可被组或其他用户写入。`certs/` 自身不可被组或其他用户写入，并须允许容器 UID 33 进入，例如目录权限 0755，或由 UID 33 持有且权限 0700。两者只读挂载到容器内 `/run/peanut-collaboration`，程序继续校验文件及 CA 摘要；不挂载应用源码、数据库凭据或应用票据密钥。
+
+服务自身没有文档数据盘：Yjs 房间在内存同步，持久草稿和保存回执通过 PHP API 写入应用数据库，持久化目录沿用应用自己的本地目录挂载。这里不增加 `data/` 副本或第二个持久化入口；容器 `/tmp` 的 tmpfs 仅用于临时文件。
 
 配置和文件准备完成后，使用标准 Compose 命令：
 
 ```sh
+cd docker
 docker compose config --quiet
 docker compose up -d
 docker compose ps
 docker compose logs -f collaboration
 ```
 
-服务通过 `.env` 指定的 Docker 网络访问应用 PHP API。当前 Compose 不发布宿主机端口，浏览器的 WSS 入口由应用已有的 TLS 反向代理提供；需要从宿主机直连时须明确配置端口映射，不能把容器监听地址当作宿主机访问地址。
+锁定的 Hocuspocus 4.6.0 默认监听端口为 80，Compose 固定为容器内 `0.0.0.0:80`；`.env` 的 `COLLABORATION_PORT` 只控制宿主机端口，默认 `80:80`，例如填写 `1234` 则映射 `1234:80`。应用反向代理通过 Docker 网络访问 `collaboration:80`，不使用宿主机映射端口。对外的 WS/HTTP 端口不提供 TLS，浏览器 WSS 入口仍由应用已有的 TLS 反向代理提供。容器仅在自己的网络命名空间允许 UID 33 绑定端口 80，仍丢弃全部 Linux capabilities。
+
+`COLLABORATION_PHP_ORIGIN` 是唯一需要配置的应用 API 根地址，例如 `https://app.example`；各操作路径由接口协议固定为 `/adminapi/internal/collaboration/v1/authorize`、`load`、`store` 等，不要求逐接口填写 URL，也不拆成可任意拼接的多个配置项。
+
+实例 ID、服务 ID、密钥编号参与 API 签名、房间归属及撤权校验；版本类型、配置修订号和配置摘要用于拒绝过期实例及混用配置的保存、排空和停止请求。它们是当前接口协议的绑定字段，不代表用户需要独立决策七个值。应用托管入口会自动填写身份和摘要；部署者先复制模板并确定宿主机端口，再由应用发布该同一份 `.env`。手动部署时使用应用给出的值。容器内地址、端口和 20 秒请求超时已固定在 Compose 中，不再作为用户配置项。
 
 程序启动后自动通过 API 校验应用身份和配置，应用按原协议激活编辑接纳。容器启动、健康检查和实际编辑保存分别记录，源码构建不能代替双人编辑、保存和重新打开的真实验收。
 
