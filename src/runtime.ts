@@ -1277,7 +1277,7 @@ export class CollaborationRuntime {
     target: AccessInvalidationTarget
   ): string {
     return invalidationJson([
-      this.php.config.instanceId, this.php.config.edition, this.php.holderKey,
+      this.php.config.instanceId, this.php.config.serviceInstanceId, this.php.holderKey,
       tenantId, target.member_id, target.connection_key, target.room_key,
       target.lease_epoch, target.authorization_revision,
     ]);
@@ -1341,7 +1341,6 @@ export class CollaborationRuntime {
         const target = targets.get(auth.connection_key);
         if (!target) return;
         if (auth.binding.instance_id !== input.instance_id
-          || auth.binding.edition !== this.php.config.edition
           || auth.holder_key !== input.holder_key
           || auth.binding.tenant_id !== input.tenant_id
           || auth.member_id !== input.subject.member_id) {

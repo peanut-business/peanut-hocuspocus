@@ -46,7 +46,7 @@ docker compose logs -f collaboration
 
 `COLLABORATION_PHP_ORIGIN` 是唯一需要配置的应用 API 根地址，例如 `https://app.example`；各操作路径由接口协议固定为 `/adminapi/internal/collaboration/v1/authorize`、`load`、`store` 等，不要求逐接口填写 URL，也不拆成可任意拼接的多个配置项。
 
-实例 ID、服务 ID、密钥编号参与服务 API 签名、房间归属及撤权校验。应用提供这些值及版本类型；进程 holder 由程序生成，房间代际与授权租约由后端维护。部署者无需填写全局 activation、probe、配置修订号或摘要来开放编辑。
+实例 ID、服务 ID、密钥编号参与服务 API 签名、房间归属及撤权校验。应用提供这些配置值；版本类型由 PHP 在可信房间 binding 中确定，Node 校验该 binding，不再另配版本类型。进程 holder 由程序生成，房间代际与授权租约由后端维护。撤权按已认证实例、服务、holder 及精确连接、房间、代际和授权修订执行，晚到授权、加载和续期也检查同一撤权标记。部署者无需填写全局 activation、probe、配置修订号或摘要来开放编辑。
 
 程序读取配置后直接监听，不执行注册、prepare、activate 或配对启动。前端携带用户登录 token 和租户/文档上下文；Node 将其通过同一受认证后端 API 转交验证，后端核实用户会话、成员、文档归属及读写权限，返回可信隔离房间和有效期。Node 不信任客户端自报身份。权限续期、动态撤权、文档加载及保存仍使用后端 API；保存成功须取得实际入库回执。
 

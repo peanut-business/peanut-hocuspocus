@@ -53,7 +53,6 @@ const runtime = new CollaborationRuntime(
     serviceInstanceId: required('COLLABORATION_SERVICE_INSTANCE_ID'),
     keyId: required('COLLABORATION_KEY_ID'),
     secret,
-    edition: required('COLLABORATION_EDITION'),
     timeoutMs: Number(required('COLLABORATION_PHP_TIMEOUT_MS')),
   }),
   required('COLLABORATION_LISTEN_ADDRESS'),

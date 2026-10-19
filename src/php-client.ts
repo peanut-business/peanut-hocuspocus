@@ -12,7 +12,6 @@ export interface ServiceConfig {
   keyId: string;
   secret: string;
   timeoutMs: number;
-  edition: string;
 }
 export type Endpoint =
   | 'authorize'
@@ -63,7 +62,6 @@ export class PhpClient {
         (s) => !/^[A-Za-z0-9_-]{1,128}$/.test(s)
       ) ||
       Buffer.byteLength(config.secret) < 32 ||
-      !['engine', 'standalone', 'multi-tenant'].includes(config.edition) ||
       !Number.isSafeInteger(config.timeoutMs) ||
       config.timeoutMs < 100 ||
       config.timeoutMs > 30000
