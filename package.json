@@ -10,7 +10,8 @@
   "scripts": {
     "check": "tsc --noEmit --project tsconfig.json",
     "build": "tsc --project tsconfig.json",
-    "start": "node dist/src/main.js"
+    "start": "node --env-file=.env dist/src/main.js",
+    "package": "node scripts/package-release.mjs"
   },
   "dependencies": {
     "@hocuspocus/server": "4.6.0",

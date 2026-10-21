@@ -1,0 +1,11 @@
+{
+  "authorize": "v1/authorize",
+  "check": "v1/check",
+  "load": "v1/load",
+  "store": "v1/store",
+  "receipt": "v1/receipt",
+  "references": "v1/references",
+  "recovery": "v1/recovery",
+  "target/prepare": "v1/target/prepare",
+  "target": "v1/target"
+}

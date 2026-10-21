@@ -5,24 +5,17 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { sha } from './digests.js';
+import { endpointUrl, normalizeBaseUrl, type ApiRoutes, type Endpoint } from './configuration.js';
+export type { Endpoint } from './configuration.js';
 export interface ServiceConfig {
-  origin: string;
+  baseUrl: string;
+  routes: ApiRoutes;
   instanceId: string;
   serviceInstanceId: string;
   keyId: string;
   secret: string;
   timeoutMs: number;
 }
-export type Endpoint =
-  | 'authorize'
-  | 'check'
-  | 'load'
-  | 'store'
-  | 'receipt'
-  | 'references'
-  | 'recovery'
-  | 'target/prepare'
-  | 'target';
 export class PhpFailure extends Error {
   constructor(
     readonly code: string,
@@ -33,6 +26,7 @@ export class PhpFailure extends Error {
   }
 }
 export class PhpClient {
+  private readonly baseUrl: URL;
   readonly holderKey = randomUUID();
   private lastBackendResponse = 0;
   private backendAvailable = false;
@@ -47,21 +41,13 @@ export class PhpClient {
     readonly config: ServiceConfig,
     private readonly http: typeof fetch = fetch
   ) {
-    const url = new URL(config.origin);
-    if (
-      url.protocol !== 'https:' ||
-      url.username ||
-      url.password ||
-      url.search ||
-      url.hash ||
-      url.pathname !== '/'
-    )
-      throw new Error('PHP_ORIGIN_TLS_REQUIRED');
+    this.baseUrl = normalizeBaseUrl(config.baseUrl);
     if (
       [config.instanceId, config.serviceInstanceId, config.keyId].some(
         (s) => !/^[A-Za-z0-9_-]{1,128}$/.test(s)
       ) ||
-      Buffer.byteLength(config.secret) < 32 ||
+      Buffer.byteLength(config.secret) < 32 || Buffer.byteLength(config.secret) > 4096 ||
+      /[\r\n\0]/.test(config.secret) ||
       !Number.isSafeInteger(config.timeoutMs) ||
       config.timeoutMs < 100 ||
       config.timeoutMs > 30000
@@ -82,7 +68,8 @@ export class PhpClient {
     }
   }
   private async request<T>(endpoint: Endpoint, input: unknown): Promise<T> {
-    const path = '/adminapi/internal/collaboration/v1/' + endpoint;
+    const url = endpointUrl(this.baseUrl, this.config.routes[endpoint]);
+    const path = url.pathname;
     const raw = JSON.stringify(input);
     if (Buffer.byteLength(raw) > 8388608)
       throw new Error('PHP_REQUEST_TOO_LARGE');
@@ -92,7 +79,7 @@ export class PhpClient {
       bodySha = sha(raw);
     const sign = (s: string): string =>
       createHmac('sha256', c.secret).update(s).digest('hex');
-    const response = await this.http(new URL(path, c.origin), {
+    const response = await this.http(url, {
       method: 'POST',
       redirect: 'error',
       credentials: 'omit',

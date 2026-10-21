@@ -1,0 +1,8 @@
+# Optional cross-Compose integration only. The ordinary service uses Compose's default network.
+services:
+  collaboration:
+    networks: [default, application]
+networks:
+  application:
+    external: true
+    name: ${NETWORK:?请填写已有外部网络名}

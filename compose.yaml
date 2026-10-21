@@ -1,0 +1,47 @@
+services:
+  collaboration:
+    image: node:22.23.2-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9
+    user: "33:33"
+    working_dir: /app
+    command: [node, dist/src/main.js]
+    env_file: .env
+    environment:
+      LISTEN_ADDRESS: 0.0.0.0
+      LISTEN_PORT: "80"
+      NODE_ENV: production
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-1234}:80"
+    volumes:
+      - type: bind
+        source: ./dist
+        target: /app/dist
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./node_modules
+        target: /app/node_modules
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./package.json
+        target: /app/package.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./config
+        target: /app/config
+        read_only: true
+        bind: {create_host_path: false}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=1m"]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "80"
+    restart: unless-stopped
+    stop_grace_period: 1m
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:80/live',{redirect:'error',credentials:'omit'}).then(r=>{if(r.status!==200)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 25s
+      retries: 3
