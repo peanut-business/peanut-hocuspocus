@@ -96,7 +96,7 @@ docker compose -f compose.yaml -f docker/ca.example.yaml up -d
 
 示例只读挂载CA并设置`NODE_EXTRA_CA_CERTS`；程序核验文件、权限、大小和固定摘要。不关闭证书验证，不修改系统或浏览器信任。WSS服务器证书和私钥由独立TLS入口管理。
 
-仅跨Compose容器别名互访时，在`.env`提供`NETWORK`并显式选用`docker/network.example.yaml`。默认不选此文件、不填NETWORK。项目名通常取目录名，多实例使用标准`docker compose -p <name>`。
+仅跨Compose容器别名互访时，在`.env`提供`NETWORK`并显式选用`docker/network.example.yaml`。默认不选此文件、不填NETWORK。需要长期启用高级示例时，可在本机`.env`设置`COMPOSE_FILE=compose.yaml:docker/ca.example.yaml:docker/network.example.yaml`（Linux/macOS），之后仍从根目录执行`docker compose up -d`。项目名通常取目录名，多实例使用标准`docker compose -p <name>`或可选`COMPOSE_PROJECT_NAME`。
 
 ## 保存、健康和停止
 
