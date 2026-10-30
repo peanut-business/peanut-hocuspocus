@@ -50,6 +50,8 @@ Compose读取`.env`注入环境，运行容器不挂整个仓库或`.env`文件�
 
 例如`https://app.example.com/adminapi/internal/collaboration`加`v1/authorize`得到`/adminapi/internal/collaboration/v1/authorize`。基地址末尾规范为一个`/`，接口路径开头的`/`被移除。使用URL解析器拼接，不替换`https://`中的斜杠；只允许已知操作和受限相对路径，禁止换域名、查询参数或通过`..`越出基路径。请求和响应签名使用实际请求的完整pathname；覆盖地址不改变请求体、签名、权限或保存协议，后端必须支持对应路径。
 
+`api.json`是公开路由配置，可使用符号链接、硬链接及标准部署权限；读取目标须为1–65536字节普通文件，内容仍须通过UTF-8、JSON、动作集合及路径校验。它不携带服务密钥，也不应用私有CA的信任锚文件限制。
+
 ## 本地开发与启动
 
 按本仓锁文件准备依赖，`pnpm build`编译到`dist/`。构建已包含类型检查时不重复运行check；只做类型检查、不输出产物时用`pnpm check`。不复制其他仓依赖。
@@ -67,7 +69,7 @@ docker compose logs -f collaboration
 
 ## 无源码发行与服务器
 
-源码固定、干净并完成对应构建和资格检查后：
+源码固定、干净并通过真实的`pnpm build`入口完成构建及对应资格检查后：
 
 ```sh
 npm run package -- /absolute/new-release-directory
@@ -76,6 +78,8 @@ npm run package -- /absolute/new-release-directory
 打包器只消费已有构建，不构建、测试、安装、发布或操作容器。发行目录及相邻`.tar.gz`包含`dist/`、`config/api.json`、Compose及高级示例、包清单、锁文件、README、LICENSE和文件摘要清单，另提供归档SHA-256文件。不包含`src/`、Git、真实配置、证书私钥、node_modules、TypeScript源码或source map。包清单保留与锁一致的依赖声明，但移除开发命令；devDependencies声明不等于服务器安装编译器。
 
 服务器解压后，用固定工具链执行`pnpm install --prod --frozen-lockfile --ignore-scripts`准备目标平台的生产依赖，再放入应用提供的完整`.env`，通过相同的Compose启动。依赖准备也可在官方Node容器中完成，服务启动不暗中执行这一步。服务器不需要源码、tsconfig或TypeScript编译。文件摘要不冒充构建来源证明或业务资格，正式采用仍须对应的固定构建回执。
+
+打包器仅核对必需编译文件、内容清单和source map限制，不用编译文本片段推断构建是否对应当前源码；`manifest.json`的`build_provenance`明确为`not_attested_by_packager`。固定源码与真实构建回执的对应关系由发行资格保留。
 
 ## 高级选项
 

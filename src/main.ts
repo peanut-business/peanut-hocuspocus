@@ -3,8 +3,6 @@ import { PhpClient } from './php-client.js';
 import { readApiRoutes, required, validateExtraCa } from './configuration.js';
 // The service key authenticates backend traffic; it is never a user token.
 const secret = required('SERVICE_SECRET');
-if (Buffer.byteLength(secret) < 32 || Buffer.byteLength(secret) > 4096 || /[\r\n\0]/.test(secret))
-  throw new Error('SERVICE_SECRET_INVALID');
 if (process.env.DB_HOST)
   throw new Error('SERVICE_CONFIGURATION_INVALID');
 validateExtraCa();

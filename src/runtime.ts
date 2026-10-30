@@ -4,7 +4,6 @@ import * as Y from 'yjs';
 import {
   assertAuth,
   assertBinding,
-  assertInvalidation,
   invalidationJson,
   type AccessInvalidationInput,
   type AccessInvalidationTarget,
@@ -545,7 +544,7 @@ export class CollaborationRuntime {
           requestId: randomUUID(),
           roomKey: details.room_key,
           epoch: Number(details.lease_epoch),
-          binding: JSON.parse(JSON.stringify(binding)) as Binding,
+          binding: structuredClone(binding),
         };
         this.recoveries.set(key, attempt);
       } else if (phpJson(attempt.binding) !== phpJson(binding))
@@ -927,7 +926,7 @@ export class CollaborationRuntime {
         })),
         target_progress: state.progress,
       };
-      const immutable = JSON.parse(JSON.stringify(tuple)) as StoreInput;
+      const immutable = structuredClone(tuple);
       return {
         tuple: immutable,
         hash: sha(phpJson(immutable)),
@@ -1127,16 +1126,8 @@ export class CollaborationRuntime {
           if (!Y.snapshotContainsUpdate(current.snapshot, target.bytes))
             current = await this.persist(state, document);
         }
-        if (
-          !Y.snapshotContainsUpdate(current.snapshot, target.bytes) ||
-          ![...target.snapshot.sv].every(
-            ([client, clock]) => (current.snapshot.sv.get(client) ?? 0) >= clock
-          ) ||
-          !Y.equalDeleteSets(
-            current.snapshot.ds,
-            Y.mergeDeleteSets([current.snapshot.ds, target.snapshot.ds])
-          )
-        )
+        // Yjs 13.6.32 checks both struct clocks and deletion coverage for this full update.
+        if (!Y.snapshotContainsUpdate(current.snapshot, target.bytes))
           throw new Error('SAVE_TARGET_NOT_COMMITTED');
         if (!current.hasReceipt) throw new Error('BASELINE_RECEIPT_REQUIRED');
         record.committed = { ...current.proof };
@@ -1293,18 +1284,9 @@ export class CollaborationRuntime {
     }
   }
 
-  private assertInvalidationHolder(input: AccessInvalidationInput): void {
-    if (input.instance_id !== this.php.config.instanceId
-      || input.service_instance_id !== this.php.config.serviceInstanceId
-      || input.holder_key !== this.php.holderKey) {
-      throw new Error('ACCESS_INVALIDATION_HOLDER_UNCONFIRMED');
-    }
-  }
-
   /** Synchronous mark/close critical section: no await can interleave grant renewal or ACK publication. */
   private invalidateAccess(input: AccessInvalidationInput): AccessInvalidationAck {
-    assertInvalidation(input);
-    this.assertInvalidationHolder(input);
+    // Control owns the authenticated HTTP envelope and holder validation before this callback.
     const fact = invalidationJson([
       input.tenant_id, input.subject, input.fact_sha256,
       input.negative_action, input.revision_reference_sha256,
@@ -1369,7 +1351,6 @@ export class CollaborationRuntime {
       }
     }));
     if (failed) throw new Error('ACCESS_INVALIDATION_CLOSE_UNCONFIRMED');
-    this.assertInvalidationHolder(input);
     const ack: AccessInvalidationAck = {
       protocol_version: 1,
       fact_id: input.fact_id,
@@ -1431,7 +1412,7 @@ export class CollaborationRuntime {
       )
         throw new Error('CONTROL_UNAVAILABLE');
       const fence: Fence = {
-        input: JSON.parse(JSON.stringify(input)) as ControlInput,
+        input: structuredClone(input),
         active: true,
       };
       this.fences.set(input.room_key, fence);

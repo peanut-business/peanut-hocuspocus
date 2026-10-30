@@ -45,9 +45,6 @@ try {
   for (const name of ['main', 'runtime', 'php-client', 'configuration', 'contracts', 'digests', 'projector', 'business-control']) {
     if (!compiled.includes(`dist/src/${name}.js`)) throw new Error('RELEASE_BUILD_REQUIRED');
   }
-  const entry = (await ordinary(join(root, 'dist/src/main.js'))).toString('utf8');
-  if (!entry.includes("required('BASE_URL')") || !entry.includes("required('SERVICE_SECRET')"))
-    throw new Error('RELEASE_CURRENT_BUILD_REQUIRED');
   temporary = await mkdtemp(join(parent, '.hocus-release-'));
   const content = join(temporary, 'content');
   await mkdir(content);

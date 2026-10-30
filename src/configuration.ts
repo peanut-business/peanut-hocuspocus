@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { sha } from './digests.js';
 
@@ -28,10 +28,10 @@ export function endpointUrl(base: URL, route: string): URL {
   return url;
 }
 
-function ordinary(path: string, maximum: number): Uint8Array {
+function readCa(path: string): Uint8Array {
   const stat = lstatSync(path);
   if (!stat.isFile() || realpathSync(path) !== path || stat.nlink !== 1 ||
-    (stat.mode & 0o022) !== 0 || stat.size < 1 || stat.size > maximum)
+    (stat.mode & 0o022) !== 0 || stat.size < 1 || stat.size > 1048576)
     throw new Error('CONFIGURATION_FILE_UNSAFE');
   return new Uint8Array(readFileSync(path));
 }
@@ -39,7 +39,13 @@ function ordinary(path: string, maximum: number): Uint8Array {
 export function readApiRoutes(): ApiRoutes {
   const path = resolve('config/api.json');
   let value: unknown;
-  try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(ordinary(path, 65536))); }
+  try {
+    // Public route configuration may be deployed through links; validate its content.
+    const stat = statSync(path);
+    if (!stat.isFile() || stat.size < 1 || stat.size > 65536)
+      throw new Error('API_CONFIGURATION_INVALID');
+    value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(path)));
+  }
   catch { throw new Error('API_CONFIGURATION_INVALID'); }
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
     Object.keys(value).sort().join(',') !== [...actions].sort().join(','))
@@ -62,7 +68,7 @@ export function validateExtraCa(): void {
   const stat = lstatSync(directory);
   if (!stat.isDirectory() || realpathSync(directory) !== directory || (stat.mode & 0o022) !== 0)
     throw new Error('CA_DIRECTORY_UNSAFE');
-  if (sha(ordinary(path, 1048576)) !== expected)
+  if (sha(readCa(path)) !== expected)
     throw new Error('CA_REFERENCE_CHANGED');
 }
 
