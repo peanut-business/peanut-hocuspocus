@@ -1,7 +1,7 @@
-# Optional cross-Compose integration only. The ordinary service uses Compose's default network.
+# Optional cross-Compose integration: use the existing external network only; do not create an unused default network.
 services:
   collaboration:
-    networks: [default, application]
+    networks: [application]
 networks:
   application:
     external: true
