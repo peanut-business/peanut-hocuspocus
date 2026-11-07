@@ -221,7 +221,7 @@ export function digest(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 }
 export function requestId(value: unknown): value is string {
-  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+  return typeof value === 'string' && /^[A-Za-z0-9_:-]{1,128}$/.test(value);
 }
 export function assertAuth(
   value: ConnectionAuth,
