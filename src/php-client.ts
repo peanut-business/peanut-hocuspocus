@@ -71,7 +71,7 @@ export class PhpClient {
     const url = endpointUrl(this.baseUrl, this.config.routes[endpoint]);
     const path = url.pathname;
     const raw = JSON.stringify(input);
-    if (Buffer.byteLength(raw) > 8388608)
+    if (Buffer.byteLength(raw) > 33554432)
       throw new Error('PHP_REQUEST_TOO_LARGE');
     const nonce = randomBytes(32).toString('hex'),
       timestamp = String(Math.floor(Date.now() / 1000));

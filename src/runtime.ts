@@ -46,6 +46,7 @@ interface Context {
   nextRenewal: number;
   renewing: boolean;
   verifiedUpdate?: Participant;
+  changeReservation?: number;
 }
 interface Capture {
   tuple: StoreInput;
@@ -109,6 +110,7 @@ interface State {
   pendingBytes: number;
   changes: AcceptedChange[];
   changeBytes: number;
+  reservedChangeBytes: number;
   lastProjection?: ReturnType<typeof project>;
 }
 interface Fence {
@@ -131,6 +133,9 @@ interface RecoveryAttempt {
   result?: Pick<Recovery, 'room_key' | 'lease_epoch' | 'binding'>;
   inFlight?: Promise<Recovery>;
 }
+// Both plain-text JSON strings are bounded by their 2 MiB full projections;
+// the fixed connection/digest/progress fields occupy less than 1 KiB.
+const maxChangeBytes = 2 * 2097152 + 1024;
 
 /** Native Hocuspocus owns documents, connections, message order, broadcasts and saveMutex. */
 export class CollaborationRuntime {
@@ -241,6 +246,7 @@ export class CollaborationRuntime {
             pendingBytes: 0,
             changes: [],
             changeBytes: 0,
+            reservedChangeBytes: 0,
           };
           this.states.set(payload.documentName, state);
         }
@@ -319,6 +325,18 @@ export class CollaborationRuntime {
             payload.payload
           );
           this.assertConnection(payload.connection, true);
+          if (state.changes.length + state.reservedChangeBytes / maxChangeBytes >= 10000
+            || state.changeBytes + state.reservedChangeBytes + maxChangeBytes + 2 > 16 * 1024 * 1024) {
+            await this.flushDocument(payload.document);
+            this.assertConnection(payload.connection, true);
+          }
+          if (state.changes.length + state.reservedChangeBytes / maxChangeBytes >= 10000
+            || state.changeBytes + state.reservedChangeBytes + maxChangeBytes + 2 > 16 * 1024 * 1024)
+            throw new Error('ROOM_BACKPRESSURE');
+          // Reserve across the SDK's async beforeSync hook chain. Other connections
+          // can pass their hooks before this frame reaches native Y.applyUpdate.
+          payload.connection.context.changeReservation = maxChangeBytes;
+          state.reservedChangeBytes += maxChangeBytes;
           const auth = payload.connection.context.auth;
           // Native Connection processes one complete frame at a time. Copy the grant
           // after the final await so renewal cannot rewrite this applied frame's source.
@@ -334,6 +352,7 @@ export class CollaborationRuntime {
         }
       },
       afterHandleMessage: async (payload) => {
+        this.releaseChangeReservation(this.state(payload.documentName), payload.context);
         delete payload.context.verifiedUpdate;
       },
       onStoreDocument: async (payload) => {
@@ -830,6 +849,12 @@ export class CollaborationRuntime {
     };
   }
 
+  private releaseChangeReservation(state: State, context: Context): void {
+    if (context.changeReservation === undefined) return;
+    state.reservedChangeBytes -= context.changeReservation;
+    delete context.changeReservation;
+  }
+
   private recordChange(state: State, document: Document, update: Uint8Array, origin: unknown): void {
     try {
       const suggestion = typeof origin === 'object' && origin !== null ? this.suggestionOrigins.get(origin) : undefined;
@@ -842,6 +867,7 @@ export class CollaborationRuntime {
       const connection = source?.source === 'connection' ? source.connection : undefined;
       if (!connection) throw new Error('UPDATE_HUMAN_SOURCE_REQUIRED');
       const context = connection.context;
+      this.releaseChangeReservation(state, context);
       this.sameRoom(state, context.auth);
       const participant = context.verifiedUpdate;
       if (!participant || !state.lastProjection) throw new Error('UPDATE_VERIFIED_SOURCE_REQUIRED');
@@ -858,7 +884,7 @@ export class CollaborationRuntime {
       };
       state.lastProjection = after;
       state.changes.push(change);
-      state.changeBytes += Buffer.byteLength(change.before_text) + Buffer.byteLength(change.after_text);
+      state.changeBytes += Buffer.byteLength(JSON.stringify(change)) + 1;
       state.dirty = true;
       state.pendingBytes += update.length;
       state.sources.set(`${participant.connection_key}:${participant.authorization_revision}`, {
@@ -899,6 +925,7 @@ export class CollaborationRuntime {
   ): Promise<void> {
     const candidate = new Y.Doc({ gc: false });
     let keys: string[];
+    let nextChangeBytes = 0;
     try {
       Y.applyUpdate(candidate, Y.encodeStateAsUpdate(connection.document));
       Y.applyUpdate(candidate, update);
@@ -907,22 +934,21 @@ export class CollaborationRuntime {
         throw new Error('UPDATE_DEPENDENCIES_MISSING');
       const projection = project(candidate);
       const before = state.lastProjection ?? project(connection.document);
-      if (state.changes.length >= 10000 || state.changeBytes + Buffer.byteLength(plainText(before.value.content))
-        + Buffer.byteLength(plainText(projection.value.content)) > 16 * 1024 * 1024)
-        throw new Error('ROOM_BACKPRESSURE');
       const nextChange = { connection_key: '0'.repeat(64), authorization_revision: '0'.repeat(64), authorized_at_ms: Date.now(),
         progress: state.progress + 1, update_sha256: '0'.repeat(64), before_projection_sha256: before.sha256,
         after_projection_sha256: projection.sha256, before_text: plainText(before.value.content), after_text: plainText(projection.value.content) };
-      // Account for the existing signed HTTP body's 8 MiB cap before accepting a
-      // frame; room batch pressure clears on the ordinary scheduled durable save.
-      if (Buffer.byteLength(JSON.stringify([...state.changes, nextChange])) + Buffer.byteLength(projection.json)
-        + Math.ceil(Y.encodeStateAsUpdate(candidate).length / 3) * 4 + 262144 > 8388608)
-        throw new Error('ROOM_BACKPRESSURE');
+      nextChangeBytes = Buffer.byteLength(JSON.stringify(nextChange)) + 1;
+      if (nextChangeBytes + 2 > 16 * 1024 * 1024) throw new Error('UPDATE_TOO_LARGE');
       keys = projection.fileKeys.filter(
         (key) => !state.references.has(key)
       );
     } finally {
       candidate.destroy();
+    }
+    if (state.changes.length >= 10000 || state.changeBytes + nextChangeBytes + 2 > 16 * 1024 * 1024) {
+      await this.flushDocument(connection.document);
+      if (state.dirty || state.capture || state.changes.length >= 10000
+        || state.changeBytes + nextChangeBytes + 2 > 16 * 1024 * 1024) throw new Error('CONTROL_STORE_UNCONFIRMED');
     }
     if (!keys.length) return;
     const auth = connection.context.auth;
@@ -1144,7 +1170,7 @@ export class CollaborationRuntime {
       if (source.progress <= tuple.target_progress) state.sources.delete(key);
     });
     state.changes = state.changes.filter((change) => change.progress > tuple.target_progress);
-    state.changeBytes = state.changes.reduce((size, change) => size + Buffer.byteLength(change.before_text) + Buffer.byteLength(change.after_text), 0);
+    state.changeBytes = state.changes.reduce((size, change) => size + Buffer.byteLength(JSON.stringify(change)) + 1, 0);
     state.dirty = !Y.snapshotContainsUpdate(
       stored.snapshot,
       Y.encodeStateAsUpdate(document)
@@ -1583,7 +1609,7 @@ export class CollaborationRuntime {
       };
       state = { auth, document: null, stateSeq: s.base_state_seq, baselineSha: s.baseline_binary_sha256,
         progress: 0, stored: null, capture: null, sources: new Map(), references: new Set(), requests: new Map(),
-        blocked: false, dirty: false, pendingBytes: 0, changes: [], changeBytes: 0 };
+        blocked: false, dirty: false, pendingBytes: 0, changes: [], changeBytes: 0, reservedChangeBytes: 0 };
       this.states.set(name, state);
       this.businessLoads.set(name, s);
       try {

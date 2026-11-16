@@ -104,7 +104,7 @@ test('native frame journal fixes each authenticated submitter and rejects unowne
     authorization_revision: sha('grant'), lease_expires_at: Date.now() + 60000 };
   const state = { auth, document: null, stateSeq: 9, baselineSha: apply.suggestion.baseline_binary_sha256,
     progress: 0, stored: null, capture: null, sources: new Map(), references: new Set(), requests: new Map(),
-    blocked: false, dirty: false, pendingBytes: 0, changes: [], changeBytes: 0 };
+    blocked: false, dirty: false, pendingBytes: 0, changes: [], changeBytes: 0, reservedChangeBytes: 0 };
   runtime.states.set('test:multi-tenant:1:3', state);
   php.call = async (endpoint) => {
     assert.equal(endpoint, 'load');
@@ -117,7 +117,9 @@ test('native frame journal fixes each authenticated submitter and rejects unowne
       verifiedUpdate: { connection_key: auth.connection_key, authorization_revision: auth.authorization_revision, authorized_at_ms: Date.now() } };
     const document = await runtime.server.hocuspocus.createDocument('test:multi-tenant:1:3', new Request('http://internal.invalid/'),
       'test', { readOnly: false, isAuthenticated: true }, context);
-    const connection = { context };
+    const connection = { context, document, readOnly: false, send: () => {}, sendStateless: () => {},
+      close: () => document.removeConnection(connection), waitForPendingMessages: async () => {} };
+    document.addConnection(connection);
     applySuggestionNode(document, suggestionNode(content('第一帧')), { source: 'connection', connection });
     context.verifiedUpdate = { ...context.verifiedUpdate, authorized_at_ms: Date.now() + 1 };
     applySuggestionNode(document, suggestionNode(content('第二帧😀')), { source: 'connection', connection });
@@ -136,7 +138,42 @@ test('native frame journal fixes each authenticated submitter and rejects unowne
         state_seq: input.base_state_seq + 1, binary_sha256: input.binary_sha256, projection_sha256: input.projection_sha256,
         persisted_at: new Date().toISOString(), target_progress: input.target_progress };
     };
-    await runtime.persist(state, document);
+    assert.equal(state.changeBytes, state.changes.reduce((bytes, change) => bytes + Buffer.byteLength(JSON.stringify(change)) + 1, 0));
+    // Simulate a nearly-full serialized ledger without allocating a large body.
+    // The next frame stays unapplied until the existing native flush has a receipt.
+    state.changeBytes = 16 * 1024 * 1024 - 1;
+    const pending = new Y.Doc({ gc: false });
+    Y.applyUpdate(pending, Y.encodeStateAsUpdate(document));
+    applySuggestionNode(pending, suggestionNode(content('下一帧\n\u0000')), { source: 'test' });
+    const update = Y.encodeStateAsUpdate(pending, Y.encodeStateVector(document));
+    const beforeFlush = project(document).sha256;
+    const payload = { connection, document, documentName: document.name, context, type: 2, payload: update };
+    await runtime.server.hocuspocus.configuration.beforeSync(payload);
+    assert.equal(state.stateSeq, 10);
+    assert.equal(state.dirty, false);
+    assert.equal(state.capture, null);
+    assert.equal(state.changeBytes, 0);
+    assert.ok(state.reservedChangeBytes > 0);
+    assert.equal(project(document).sha256, beforeFlush);
+    await runtime.server.hocuspocus.configuration.afterHandleMessage(payload);
+    assert.equal(state.reservedChangeBytes, 0);
+    // The SDK awaits beforeSync before it applies a frame. Hold three completed
+    // hooks without applying them; a fourth must not overbook the journal budget.
+    const queued = Array.from({ length: 4 }, () => {
+      const queuedContext = { ...context };
+      const queuedConnection = { ...connection, context: queuedContext };
+      document.addConnection(queuedConnection);
+      return { ...payload, connection: queuedConnection, context: queuedContext };
+    });
+    const admissions = await Promise.allSettled(queued.map((frame) => runtime.server.hocuspocus.configuration.beforeSync(frame)));
+    assert.equal(admissions.filter((result) => result.status === 'fulfilled').length, 3);
+    assert.equal(admissions.filter((result) => result.status === 'rejected').length, 1);
+    for (const frame of queued) {
+      await runtime.server.hocuspocus.configuration.afterHandleMessage(frame);
+      document.removeConnection(frame.connection);
+    }
+    assert.equal(state.reservedChangeBytes, 0);
+    pending.destroy();
     const baseline = project(document);
     const baselineBytes = Y.encodeStateAsUpdate(document);
     assert.equal((await runtime.controlRoom(drain)).phase, 'drained');
