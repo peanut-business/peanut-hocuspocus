@@ -19,6 +19,8 @@ import {
   type Committed,
   type Binding,
   type Recovery,
+  type AcceptedChange,
+  roomName,
 } from './contracts.js';
 import { PhpClient, PhpFailure } from './php-client.js';
 import { phpJson, sha } from './digests.js';
@@ -27,6 +29,9 @@ import {
   project,
   projectorVersion,
   type Structured,
+  plainText,
+  suggestionNode,
+  applySuggestionNode,
 } from './projector.js';
 import {
   Control,
@@ -102,6 +107,9 @@ interface State {
   blockedCode?: string;
   dirty: boolean;
   pendingBytes: number;
+  changes: AcceptedChange[];
+  changeBytes: number;
+  lastProjection?: ReturnType<typeof project>;
 }
 interface Fence {
   input: ControlInput;
@@ -111,6 +119,9 @@ interface Fence {
   releaseInput?: string;
   release?: Promise<Record<string, unknown>>;
   released?: Record<string, unknown>;
+  suggestionInput?: string;
+  suggestion?: Promise<Record<string, unknown>>;
+  applied?: Record<string, unknown>;
 }
 interface RecoveryAttempt {
   requestId: string;
@@ -131,6 +142,8 @@ export class CollaborationRuntime {
   private readonly controlOperations = new Map<string, Fence>();
   private readonly recoveries = new Map<string, RecoveryAttempt>();
   private readonly control: Control;
+  private readonly suggestionOrigins = new WeakMap<object, Fence>();
+  private readonly businessLoads = new Map<string, NonNullable<ControlInput['suggestion']>>();
   // Exact negative tuples last for this process holder; never evict a fence for an in-flight grant.
   private readonly invalidatedGrants = new Set<string>();
   private readonly invalidationFacts = new Map<string, string>();
@@ -226,6 +239,8 @@ export class CollaborationRuntime {
             blocked: false,
             dirty: false,
             pendingBytes: 0,
+            changes: [],
+            changeBytes: 0,
           };
           this.states.set(payload.documentName, state);
         }
@@ -245,7 +260,14 @@ export class CollaborationRuntime {
       onLoadDocument: async (payload) => {
         const state = this.state(payload.documentName);
         try {
-          await this.load(state, payload.document, payload.context);
+          const business = this.businessLoads.get(payload.documentName);
+          if (business) this.loadBusinessBaseline(state, payload.document, business);
+          else await this.load(state, payload.document, payload.context);
+          state.lastProjection = project(payload.document);
+          // Native update events run synchronously, before another connection can mutate
+          // the document or replace verifiedUpdate. Async onChange hooks cannot journal frames.
+          payload.document.on('update', (update: Uint8Array, origin: unknown) =>
+            this.recordChange(state, payload.document, update, origin));
         } catch (error) {
           if (!state.capture && !state.dirty) {
             this.states.delete(payload.documentName);
@@ -313,30 +335,6 @@ export class CollaborationRuntime {
       },
       afterHandleMessage: async (payload) => {
         delete payload.context.verifiedUpdate;
-      },
-      onChange: async (payload) => {
-        const state = this.state(payload.documentName);
-        try {
-          if (!payload.connection)
-            throw new Error('UPDATE_HUMAN_SOURCE_REQUIRED');
-          const context = payload.connection.context as Context;
-          this.sameRoom(state, context.auth);
-          const participant = context.verifiedUpdate;
-          if (!participant) throw new Error('UPDATE_VERIFIED_SOURCE_REQUIRED');
-          state.progress += 1;
-          state.dirty = true;
-          state.pendingBytes += payload.update.length;
-          state.sources.set(
-            `${participant.connection_key}:${participant.authorization_revision}`,
-            {
-              participant: { ...participant },
-              progress: state.progress,
-            }
-          );
-          state.references = new Set(project(payload.document).fileKeys);
-        } catch {
-          this.block(state, 'UPDATE_SOURCE_OR_PROJECTION_INVALID');
-        }
       },
       onStoreDocument: async (payload) => {
         try {
@@ -832,6 +830,68 @@ export class CollaborationRuntime {
     };
   }
 
+  private recordChange(state: State, document: Document, update: Uint8Array, origin: unknown): void {
+    try {
+      const suggestion = typeof origin === 'object' && origin !== null ? this.suggestionOrigins.get(origin) : undefined;
+      if (suggestion) {
+        if (!suggestion.active || this.fences.get(state.auth.room_key) !== suggestion || !suggestion.drained)
+          throw new Error('SUGGESTION_BARRIER_INVALID');
+        return;
+      }
+      const source = origin as { source?: string; connection?: Connection<Context> } | null;
+      const connection = source?.source === 'connection' ? source.connection : undefined;
+      if (!connection) throw new Error('UPDATE_HUMAN_SOURCE_REQUIRED');
+      const context = connection.context;
+      this.sameRoom(state, context.auth);
+      const participant = context.verifiedUpdate;
+      if (!participant || !state.lastProjection) throw new Error('UPDATE_VERIFIED_SOURCE_REQUIRED');
+      const before = state.lastProjection;
+      const after = project(document);
+      const change: AcceptedChange = {
+        ...participant,
+        progress: ++state.progress,
+        update_sha256: sha(update),
+        before_projection_sha256: before.sha256,
+        after_projection_sha256: after.sha256,
+        before_text: plainText(before.value.content),
+        after_text: plainText(after.value.content),
+      };
+      state.lastProjection = after;
+      state.changes.push(change);
+      state.changeBytes += Buffer.byteLength(change.before_text) + Buffer.byteLength(change.after_text);
+      state.dirty = true;
+      state.pendingBytes += update.length;
+      state.sources.set(`${participant.connection_key}:${participant.authorization_revision}`, {
+        participant: { ...participant }, progress: state.progress,
+      });
+      state.references = new Set(after.fileKeys);
+    } catch {
+      this.block(state, 'UPDATE_SOURCE_OR_PROJECTION_INVALID');
+    }
+  }
+
+  private loadBusinessBaseline(state: State, document: Document, input: NonNullable<ControlInput['suggestion']>): void {
+    assertBinding(input.binding, document.name, this.php.config.instanceId);
+    const bytes = binary(input.baseline_binary_base64);
+    if (sha(bytes) !== input.baseline_binary_sha256) throw new Error('SUGGESTION_BASELINE_INVALID');
+    Y.applyUpdate(document, bytes);
+    const projection = project(document);
+    if (projection.sha256 !== input.baseline_projection_sha256
+      || projection.json !== phpJson(input.baseline_structured_content, true)) throw new Error('SUGGESTION_BASELINE_INVALID');
+    const snapshot = Y.snapshot(document);
+    state.document = document;
+    state.stateSeq = input.base_state_seq;
+    state.baselineSha = input.baseline_binary_sha256;
+    state.references = new Set(projection.fileKeys);
+    state.stored = {
+      hasReceipt: false,
+      proof: { type: 'committed', documentId: input.binding.document_id, roomEpoch: state.auth.lease_epoch,
+        stateSeq: input.base_state_seq, captureId: `baseline:${input.baseline_binary_sha256}`,
+        binarySha256: input.baseline_binary_sha256, snapshotBase64: Buffer.from(Y.encodeSnapshot(snapshot)).toString('base64') },
+      snapshot, tuple: null, bytes, value: projection.value, referenceDigest: projection.referenceDigest, progress: 0,
+    };
+  }
+
   private async validateReferences(
     state: State,
     connection: Connection<Context>,
@@ -845,7 +905,20 @@ export class CollaborationRuntime {
       // Pending unresolved CRDT dependencies are not accepted as invisible future writes.
       if (candidate.store.pendingStructs || candidate.store.pendingDs)
         throw new Error('UPDATE_DEPENDENCIES_MISSING');
-      keys = project(candidate).fileKeys.filter(
+      const projection = project(candidate);
+      const before = state.lastProjection ?? project(connection.document);
+      if (state.changes.length >= 10000 || state.changeBytes + Buffer.byteLength(plainText(before.value.content))
+        + Buffer.byteLength(plainText(projection.value.content)) > 16 * 1024 * 1024)
+        throw new Error('ROOM_BACKPRESSURE');
+      const nextChange = { connection_key: '0'.repeat(64), authorization_revision: '0'.repeat(64), authorized_at_ms: Date.now(),
+        progress: state.progress + 1, update_sha256: '0'.repeat(64), before_projection_sha256: before.sha256,
+        after_projection_sha256: projection.sha256, before_text: plainText(before.value.content), after_text: plainText(projection.value.content) };
+      // Account for the existing signed HTTP body's 8 MiB cap before accepting a
+      // frame; room batch pressure clears on the ordinary scheduled durable save.
+      if (Buffer.byteLength(JSON.stringify([...state.changes, nextChange])) + Buffer.byteLength(projection.json)
+        + Math.ceil(Y.encodeStateAsUpdate(candidate).length / 3) * 4 + 262144 > 8388608)
+        throw new Error('ROOM_BACKPRESSURE');
+      keys = projection.fileKeys.filter(
         (key) => !state.references.has(key)
       );
     } finally {
@@ -924,6 +997,7 @@ export class CollaborationRuntime {
         participants: [...state.sources.values()].map((source) => ({
           ...source.participant,
         })),
+        changes: structuredClone(state.changes),
         target_progress: state.progress,
       };
       const immutable = structuredClone(tuple);
@@ -980,6 +1054,13 @@ export class CollaborationRuntime {
     return result.receipt;
   }
   private async persist(state: State, document: Document): Promise<Stored> {
+    if (state.blockedCode === 'UPDATE_SOURCE_OR_PROJECTION_INVALID') throw new Error('UPDATE_SOURCE_OR_PROJECTION_INVALID');
+    // The PHP business transaction owns this fixed signed capture. A pending SDK
+    // autosave must never turn it into an ordinary connection-attributed store.
+    if (this.fences.get(state.auth.room_key)?.applied) {
+      if (!state.stored) throw new Error('SUGGESTION_BASELINE_INVALID');
+      return state.stored;
+    }
     if (
       !state.capture &&
       state.stored &&
@@ -991,6 +1072,8 @@ export class CollaborationRuntime {
       state.dirty = false;
       state.pendingBytes = 0;
       state.sources.clear();
+      state.changes = [];
+      state.changeBytes = 0;
       return state.stored;
     }
     // Fixed bytes, projection, participants and original base/store identity precede every await.
@@ -1060,6 +1143,8 @@ export class CollaborationRuntime {
     state.sources.forEach((source, key) => {
       if (source.progress <= tuple.target_progress) state.sources.delete(key);
     });
+    state.changes = state.changes.filter((change) => change.progress > tuple.target_progress);
+    state.changeBytes = state.changes.reduce((size, change) => size + Buffer.byteLength(change.before_text) + Buffer.byteLength(change.after_text), 0);
     state.dirty = !Y.snapshotContainsUpdate(
       stored.snapshot,
       Y.encodeStateAsUpdate(document)
@@ -1427,6 +1512,18 @@ export class CollaborationRuntime {
       existing.input.lease_epoch !== input.lease_epoch
     )
       throw new Error('ORIGINAL_CONTROL_OPERATION_REQUIRED');
+    if (input.action === 'suggestion.accept') {
+      const fixed = phpJson(input);
+      if (!existing.active || existing.releaseInput !== undefined
+        || existing.suggestionInput !== undefined && existing.suggestionInput !== fixed)
+        throw new Error('ORIGINAL_SUGGESTION_REQUIRED');
+      if (existing.applied) return existing.applied;
+      if (existing.suggestion) return existing.suggestion;
+      existing.suggestionInput = fixed;
+      const pending = this.applySuggestion(existing, input);
+      existing.suggestion = pending;
+      return pending;
+    }
     const releaseInput = phpJson(input);
     if (
       existing.releaseInput !== undefined &&
@@ -1459,6 +1556,74 @@ export class CollaborationRuntime {
     );
     return pending;
   }
+  private async applySuggestion(fence: Fence, input: ControlInput): Promise<Record<string, unknown>> {
+    if (!fence.drained && fence.drain) await fence.drain;
+    if (!fence.drained || !input.suggestion) throw new Error('CONTROL_DRAIN_UNCONFIRMED');
+    const s = input.suggestion;
+    let candidate: ReturnType<typeof suggestionNode>;
+    try {
+      candidate = suggestionNode(s.structured_content);
+    } catch {
+      // This code is reserved for a confirmed pre-mutation rejection. The PHP
+      // caller may close the unchanged business operation only after signed ACK.
+      throw new Error('SUGGESTION_CONTENT_INVALID');
+    }
+    const name = roomName(s.binding);
+    assertBinding(s.binding, name, this.php.config.instanceId);
+    let state = this.states.get(name);
+    if (!state) {
+      if (fence.drained.phase !== 'offline') throw new Error('CONTROL_LOAD_UNCONFIRMED');
+      // This is a signed business load of real persisted CRDT bytes, never a
+      // fabricated connection grant or JSON-to-Y.Doc reconstruction.
+      const auth: ConnectionAuth = {
+        protocol: 2, binding: s.binding, document_id: s.binding.document_id,
+        room_key: input.room_key, holder_key: input.holder_key, lease_epoch: input.lease_epoch,
+        connection_key: '', authorization_revision: '', mode: 'read', member_id: s.actor_member_id,
+        nickname: '', lease_expires_at: 0,
+      };
+      state = { auth, document: null, stateSeq: s.base_state_seq, baselineSha: s.baseline_binary_sha256,
+        progress: 0, stored: null, capture: null, sources: new Map(), references: new Set(), requests: new Map(),
+        blocked: false, dirty: false, pendingBytes: 0, changes: [], changeBytes: 0 };
+      this.states.set(name, state);
+      this.businessLoads.set(name, s);
+      try {
+        await this.server.hocuspocus.createDocument(name, new Request('http://internal.invalid/'),
+          `business:${input.operation_id}`, { readOnly: true, isAuthenticated: true },
+          { auth, checkedAt: Date.now(), nextRenewal: 0, renewing: false });
+      } finally {
+        this.businessLoads.delete(name);
+      }
+    }
+    const document = state.document;
+    if (!document || document.isDestroyed || state.blocked || state.dirty || state.capture
+      || state.auth.holder_key !== input.holder_key || state.auth.lease_epoch !== input.lease_epoch
+      || phpJson(state.auth.binding) !== phpJson(s.binding) || state.stateSeq !== s.base_state_seq
+      || state.baselineSha !== s.baseline_binary_sha256
+      || sha(Y.encodeStateAsUpdate(document)) !== s.baseline_binary_sha256
+      || project(document).sha256 !== s.baseline_projection_sha256) throw new Error('SUGGESTION_BASELINE_CONFLICT');
+    return document.saveMutex.runExclusive(() => {
+      const origin = { source: 'local' as const, skipStoreHooks: true };
+      this.suggestionOrigins.set(origin, fence);
+      applySuggestionNode(document, candidate, origin);
+      const projection = project(document);
+      const bytes = Y.encodeStateAsUpdate(document);
+      if (bytes.length > 4194304 || projection.json !== phpJson(s.structured_content, true)) {
+        this.block(state, 'SUGGESTION_CAPTURE_INVALID');
+        throw new Error('SUGGESTION_CAPTURE_INVALID');
+      }
+      const applied: Record<string, unknown> = {
+        ...fence.drained, phase: 'suggestion_applied', base_state_seq: s.base_state_seq,
+        baseline_binary_sha256: s.baseline_binary_sha256, baseline_projection_sha256: s.baseline_projection_sha256,
+        actor_member_id: s.actor_member_id,
+        binary_base64: Buffer.from(bytes).toString('base64'), binary_sha256: sha(bytes),
+        structured_content: projection.value, projection_sha256: projection.sha256,
+        reference_digest: projection.referenceDigest, snapshot_base64: Buffer.from(Y.encodeSnapshot(Y.snapshot(document))).toString('base64'),
+      };
+      fence.applied = applied;
+      return applied;
+    });
+  }
+
   private drainControl(fence: Fence): Promise<Record<string, unknown>> {
     if (fence.drained) return Promise.resolve(fence.drained);
     if (fence.drain) return fence.drain;
@@ -1570,7 +1735,7 @@ export class CollaborationRuntime {
         .forEach((connection) =>
           this.connectionError(connection, 'ROOM_EPOCH_CHANGED')
         );
-      await this.flushDocument(document);
+      if (!fence.applied) await this.flushDocument(document);
       await this.server.hocuspocus.unloadDocument(document);
       if (this.server.hocuspocus.documents.has(document.name))
         throw new Error('CONTROL_UNLOAD_UNCONFIRMED');

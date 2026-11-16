@@ -8,13 +8,15 @@ import {
   type AccessInvalidationAck,
 } from './contracts.js';
 import { sha } from './digests.js';
+import type { Binding } from './contracts.js';
+import type { Structured } from './projector.js';
 
 export const controlPath =
   '/internal/collaboration/control/v1/business-barrier';
 export const accessPath = '/internal/collaboration/access/v1/invalidate';
 export interface ControlInput {
   protocol: 2;
-  action: 'drain' | 'release';
+  action: 'drain' | 'release' | 'suggestion.accept';
   operation_id: string;
   input_sha256: string;
   room_key: string;
@@ -22,6 +24,16 @@ export interface ControlInput {
   lease_epoch: number;
   result_epoch?: number;
   status?: 'active' | 'archived' | 'blocked_recovery';
+  suggestion?: {
+    binding: Binding;
+    actor_member_id: number;
+    base_state_seq: number;
+    baseline_binary_sha256: string;
+    baseline_binary_base64: string;
+    baseline_structured_content: Structured;
+    baseline_projection_sha256: string;
+    structured_content: Structured;
+  };
 }
 /** Existing service HMAC transport, with the native protocol-2 per-room body. */
 export class Control {
@@ -103,7 +115,7 @@ export class Control {
       for await (const part of request) {
         const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
         length += chunk.length;
-        if (length > 65536)
+        if (length > 16777216)
           throw new Error('CONTROL_REQUEST_TOO_LARGE');
         chunks.push(new Uint8Array(chunk));
       }
@@ -149,12 +161,14 @@ export class Control {
         const expectedKeys =
           roomInput?.action === 'drain'
             ? 'action,holder_key,input_sha256,lease_epoch,operation_id,protocol,room_key'
+            : roomInput?.action === 'suggestion.accept'
+            ? 'action,holder_key,input_sha256,lease_epoch,operation_id,protocol,room_key,suggestion'
             : 'action,holder_key,input_sha256,lease_epoch,operation_id,protocol,result_epoch,room_key,status';
         if (
           !input ||
           Object.keys(input).sort().join(',') !== expectedKeys ||
           input.protocol !== 2 ||
-          !['drain', 'release'].includes(roomInput.action) ||
+          !['drain', 'release', 'suggestion.accept'].includes(roomInput.action) ||
           !/^[A-Za-z0-9:_-]{1,128}$/.test(roomInput.operation_id) ||
           !digest(roomInput.input_sha256) ||
           !digest(roomInput.room_key) ||
@@ -168,6 +182,14 @@ export class Control {
               )))
         )
           throw new Error('CONTROL_INPUT_INVALID');
+        if (roomInput.action === 'suggestion.accept') {
+          const s = roomInput.suggestion;
+          if (!s || Object.keys(s).sort().join(',') !== 'actor_member_id,base_state_seq,baseline_binary_base64,baseline_binary_sha256,baseline_projection_sha256,baseline_structured_content,binding,structured_content'
+            || !Number.isSafeInteger(s.actor_member_id) || s.actor_member_id < 1
+            || !Number.isSafeInteger(s.base_state_seq) || s.base_state_seq < 0
+            || !digest(s.baseline_binary_sha256) || !digest(s.baseline_projection_sha256)
+            || typeof s.baseline_binary_base64 !== 'string') throw new Error('CONTROL_INPUT_INVALID');
+        }
         if (input.holder_key !== holderKey || holderKey !== this.php.holderKey)
           throw new Error('CONTROL_HOLDER_CHANGED');
         result = { ok: true, data: await this.execute(roomInput) };

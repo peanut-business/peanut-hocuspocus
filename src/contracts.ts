@@ -139,6 +139,14 @@ export interface Participant {
   authorization_revision: string;
   authorized_at_ms: number;
 }
+export interface AcceptedChange extends Participant {
+  progress: number;
+  update_sha256: string;
+  before_projection_sha256: string;
+  after_projection_sha256: string;
+  before_text: string;
+  after_text: string;
+}
 export interface Recovery {
   protocol: 2;
   request_id: string;
@@ -163,6 +171,7 @@ export interface StoreInput extends Binding {
   binary_base64: string;
   structured_content: Structured;
   participants: Participant[];
+  changes: AcceptedChange[];
   target_progress: number;
 }
 export interface Receipt {

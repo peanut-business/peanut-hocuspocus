@@ -3,6 +3,7 @@ import { Schema, type NodeSpec, type MarkSpec } from '@tiptap/pm/model';
 import {
   prosemirrorJSONToYDoc,
   yXmlFragmentToProsemirrorJSON,
+  updateYFragment,
 } from '@tiptap/y-tiptap';
 import { phpJson, sha } from './digests.js';
 export const projectorVersion = 'peanut.richtext-yjs/1';
@@ -86,6 +87,40 @@ marks.link = {
 };
 marks.textStyle = { attrs: attrs(['color']) };
 export const schema = new Schema({ nodes, marks });
+
+/** Same text profile as RichTextProjection::plainText(); no normalization. */
+export function plainText(node: Record<string, unknown>): string {
+  const type = String(node.type);
+  if (type === 'text') return String(node.text);
+  if (type === 'hardBreak') return '\n';
+  if (['image', 'video', 'audio', 'file', 'media', 'horizontalRule'].includes(type)) return '\uFFFC';
+  const separator = ['paragraph', 'heading', 'codeBlock'].includes(type) ? '' : type === 'tableRow' ? '\t' : '\n';
+  return ((node.content ?? []) as Record<string, unknown>[]).map(plainText).join(separator);
+}
+
+/** Validate before mutating the authoritative native document. */
+export function suggestionNode(value: Structured): ReturnType<typeof schema.nodeFromJSON> {
+  if (!value || Object.keys(value).sort().join(',') !== 'annotations,content,editorModel,schemaVersion'
+    || value.schemaVersion !== 'peanut.richtext/1' || value.editorModel !== 'tiptap-prosemirror'
+    || !Array.isArray(value.annotations) || value.annotations.length) throw new Error('SUGGESTION_CONTENT_INVALID');
+  let count = 0;
+  const visit = (node: Record<string, unknown>, depth: number): void => {
+    if (++count > 50000 || depth > 60) throw new Error('PROJECTION_TOO_DEEP');
+    validateAttributes(node);
+    for (const child of (node.content ?? []) as Record<string, unknown>[]) visit(child, depth + 1);
+  };
+  visit(value.content, 0);
+  const node = schema.nodeFromJSON(value.content);
+  node.check();
+  if (Buffer.byteLength(phpJson(value, true)) > 2097152
+    || phpJson(clean(node.toJSON()), true) !== phpJson(value.content, true)) throw new Error('SUGGESTION_CONTENT_INVALID');
+  return node;
+}
+
+export function applySuggestionNode(doc: Y.Doc, node: ReturnType<typeof schema.nodeFromJSON>, origin: object): void {
+  doc.transact(() => updateYFragment(doc, doc.getXmlFragment(fragmentName), node,
+    { mapping: new Map(), isOMark: new Map() }), origin);
+}
 function validLink(value: unknown): boolean {
   if (
     typeof value !== 'string' ||
