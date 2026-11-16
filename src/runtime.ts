@@ -367,6 +367,9 @@ export class CollaborationRuntime {
       },
       beforeUnloadDocument: async (payload) => {
         const state = this.state(payload.documentName);
+        const fence = this.fences.get(state.auth.room_key);
+        if (fence?.active && fence.releaseInput === undefined)
+          throw new Error('BUSINESS_BARRIER_DOCUMENT_RETAINED');
         if (state.capture || state.dirty)
           throw new Error('UNCOMMITTED_DOCUMENT_RETAINED');
       },
@@ -1336,7 +1339,10 @@ export class CollaborationRuntime {
       const checked = await Promise.race([
         this.php.call<ConnectionAuth>('check', {
           connection_key: original.connection_key,
-          mode: original.mode,
+          // Presence renewal is not new write admission. PHP still revalidates
+          // edit permission for the original write connection; frames use the
+          // native fence and their own write check, including during drain.
+          mode: 'read',
         }),
         new Promise<never>((_, reject) => {
           deadline = setTimeout(

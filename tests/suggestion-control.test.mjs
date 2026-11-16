@@ -84,6 +84,56 @@ test('baseline drift rejects before editing and original barrier stays closed', 
   } finally { await dispose(runtime); }
 });
 
+test('loaded baseline drains at zero, renews presence and retains native custody until original release', async () => {
+  const { runtime, php, drain, apply } = fixture();
+  const auth = { protocol: 2, binding, document_id: 3, room_key: drain.room_key, holder_key: php.holderKey,
+    lease_epoch: 2, mode: 'write', member_id: 4, nickname: 'tester', connection_key: sha('connection'),
+    authorization_revision: sha('grant'), lease_expires_at: Date.now() + 60000 };
+  const state = { auth, document: null, stateSeq: 9, baselineSha: apply.suggestion.baseline_binary_sha256,
+    progress: 0, stored: null, capture: null, sources: new Map(), references: new Set(), requests: new Map(),
+    blocked: false, dirty: false, pendingBytes: 0, changes: [], changeBytes: 0, reservedChangeBytes: 0 };
+  runtime.states.set('test:multi-tenant:1:3', state);
+  php.call = async (endpoint) => {
+    assert.equal(endpoint, 'load');
+    return { binding, holder_key: php.holderKey, document_id: 3, lease_epoch: 2, state_seq: 9,
+      state_sha256: apply.suggestion.baseline_binary_sha256, binary_base64: apply.suggestion.baseline_binary_base64,
+      initialization_required: false, structured_content: apply.suggestion.baseline_structured_content,
+      store_id: 'baseline:fixed-zero-progress', schema_version: 'peanut.richtext/1' };
+  };
+  try {
+    const context = { auth, checkedAt: Date.now(), nextRenewal: 0, renewing: true };
+    const document = await runtime.server.hocuspocus.createDocument('test:multi-tenant:1:3', new Request('http://internal.invalid/'),
+      'test', { readOnly: false, isAuthenticated: true }, context);
+    let closed = 0;
+    const connection = { context, document, readOnly: false, send: () => {}, sendStateless: () => {},
+      close: () => { ++closed; document.removeConnection(connection); }, waitForPendingMessages: async () => {} };
+    document.addConnection(connection);
+    const drained = await runtime.controlRoom(drain);
+    assert.equal(drained.phase, 'drained');
+    assert.equal(drained.target_progress, 0);
+    assert.equal(drained.store_id, 'baseline:fixed-zero-progress');
+    assert.equal(connection.readOnly, true);
+    php.call = async (endpoint, input) => {
+      assert.equal(endpoint, 'check');
+      assert.deepEqual(input, { connection_key: auth.connection_key, mode: 'read' });
+      return { ...auth, lease_expires_at: Date.now() + 60000 };
+    };
+    await runtime.renew(state, connection);
+    assert.equal(closed, 0);
+    assert.equal(context.auth.mode, 'write');
+    // Real SDK unload runs the beforeUnload hook even after the final socket leaves.
+    document.removeConnection(connection);
+    await runtime.server.hocuspocus.unloadDocument(document);
+    assert.equal(runtime.server.hocuspocus.documents.get(document.name), document);
+    assert.equal(runtime.states.get(document.name), state);
+    assert.equal(document.isDestroyed, false);
+    assert.deepEqual(await runtime.controlRoom(drain), drained);
+    assert.equal((await runtime.controlRoom({ ...drain, action: 'release', result_epoch: 3, status: 'active' })).phase, 'released');
+    assert.equal(runtime.server.hocuspocus.documents.has(document.name), false);
+    assert.equal(runtime.states.has(document.name), false);
+  } finally { await dispose(runtime); }
+});
+
 test('invalid candidate confirms pre-mutation rejection and can release unchanged room', async () => {
   const { runtime, drain, apply } = fixture();
   try {
