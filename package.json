@@ -10,6 +10,7 @@
   "scripts": {
     "check": "tsc --noEmit --project tsconfig.json",
     "build": "tsc --project tsconfig.json",
+    "test": "pnpm run build && node --test tests/*.test.mjs",
     "start": "node --env-file=.env dist/src/main.js",
     "package": "node scripts/package-release.mjs"
   },

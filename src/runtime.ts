@@ -82,6 +82,7 @@ interface TargetRecord {
   confirmation: Record<string, unknown> | null;
   committed: Committed | null;
   inFlight?: Promise<Committed>;
+  settledAt?: number;
 }
 interface Stored {
   hasReceipt: boolean;
@@ -118,6 +119,7 @@ interface Fence {
   drain?: Promise<Record<string, unknown>>;
   drained?: Record<string, unknown>;
   active: boolean;
+  releasedAt?: number;
   releaseInput?: string;
   release?: Promise<Record<string, unknown>>;
   released?: Record<string, unknown>;
@@ -131,11 +133,13 @@ interface RecoveryAttempt {
   epoch: number;
   binding: Binding;
   result?: Pick<Recovery, 'room_key' | 'lease_epoch' | 'binding'>;
+  settledAt?: number;
   inFlight?: Promise<Recovery>;
 }
 // Both plain-text JSON strings are bounded by their 2 MiB full projections;
 // the fixed connection/digest/progress fields occupy less than 1 KiB.
 const maxChangeBytes = 2 * 2097152 + 1024;
+const ledgerTtlMs = 15 * 60 * 1000;
 
 /** Native Hocuspocus owns documents, connections, message order, broadcasts and saveMutex. */
 export class CollaborationRuntime {
@@ -149,11 +153,16 @@ export class CollaborationRuntime {
   private readonly control: Control;
   private readonly suggestionOrigins = new WeakMap<object, Fence>();
   private readonly businessLoads = new Map<string, NonNullable<ControlInput['suggestion']>>();
-  // Exact negative tuples last for this process holder; never evict a fence for an in-flight grant.
-  private readonly invalidatedGrants = new Set<string>();
+  // Negative tuples and idempotency ledgers expire after ledgerTtlMs so long-lived
+  // processes cannot hit permanent backpressure DoS once historical entries age out.
+  private readonly invalidatedGrants = new Map<string, number>();
   private readonly invalidationFacts = new Map<string, string>();
+  private readonly invalidationFactTimes = new Map<string, number>();
   private readonly invalidationOperations = new Map<string, string>();
+  private readonly invalidationOperationTimes = new Map<string, number>();
   private readonly invalidationResults = new Map<string, AccessInvalidationAck>();
+  private readonly invalidationResultTimes = new Map<string, number>();
+  private readonly targetRecordUnloadedAt = new Map<string, number>();
   private maintenance: ReturnType<typeof setInterval> | undefined;
   private stopping = false;
   private readonly sockets = new Set<import('node:net').Socket>();
@@ -230,6 +239,9 @@ export class CollaborationRuntime {
           throw new Error('DOCUMENT_BARRIER');
         let state = this.states.get(payload.documentName);
         if (!state) {
+          if (this.states.size >= 1000)
+            throw new Error('CONNECTION_UNAVAILABLE');
+          this.targetRecordUnloadedAt.delete(payload.documentName);
           state = {
             auth,
             document: null,
@@ -375,6 +387,15 @@ export class CollaborationRuntime {
       },
       afterUnloadDocument: async (payload) => {
         this.states.delete(payload.documentName);
+        const records = this.targetRecords.get(payload.documentName);
+        if (records) {
+          const allSettled = [...records.values()].every(
+            (record) => record.phase === 'completed' || record.phase === 'canceled'
+          );
+          if (allSettled) {
+            this.targetRecordUnloadedAt.set(payload.documentName, Date.now());
+          }
+        }
       },
       onStateless: async (payload) => {
         try {
@@ -407,21 +428,41 @@ export class CollaborationRuntime {
           const auth = payload.connection.context.auth as ConnectionAuth;
           let record = state.requests.get(id);
           if (!record) {
-            if (
-              state.requests.size >= 1000 ||
-              [...state.requests.values()].filter(
-                (value) =>
-                  value.actor.memberId === auth.member_id &&
-                  value.phase !== 'completed' &&
-                  value.phase !== 'canceled'
-              ).length >= 16
-            )
+            const now = Date.now();
+            if (state.requests.size >= 1000) {
+              for (const [reqKey, existingRecord] of state.requests) {
+                if (
+                  (existingRecord.phase === 'completed' || existingRecord.phase === 'canceled') &&
+                  existingRecord.settledAt !== undefined &&
+                  now - existingRecord.settledAt >= ledgerTtlMs
+                ) {
+                  state.requests.delete(reqKey);
+                }
+              }
+            }
+            let activeForMember = 0;
+            for (const existingRecord of state.requests.values()) {
+              if (
+                existingRecord.actor.memberId === auth.member_id &&
+                existingRecord.phase !== 'completed' &&
+                existingRecord.phase !== 'canceled'
+              ) {
+                activeForMember += 1;
+              }
+            }
+            if (state.requests.size >= 1000 || activeForMember >= 16)
               throw new Error('SAVE_TARGET_BACKPRESSURE');
             if (
               !this.targetRecords.has(payload.documentName) &&
               this.targetRecords.size >= 1000
-            )
-              throw new Error('SAVE_TARGET_BACKPRESSURE');
+            ) {
+              this.pruneExpiredLedgers(now);
+              if (this.targetRecords.size >= 1000) {
+                this.evictOldestSettledTargetRecord();
+              }
+              if (this.targetRecords.size >= 1000)
+                throw new Error('SAVE_TARGET_BACKPRESSURE');
+            }
             record = {
               fixedClick: this.fixedContent(payload.document, state.progress),
               actor: {
@@ -558,8 +599,19 @@ export class CollaborationRuntime {
       const key = `${details.room_key}:${details.lease_epoch}`;
       let attempt = this.recoveries.get(key);
       if (!attempt) {
-        if (this.recoveries.size >= 1000)
-          throw new Error('RECOVERY_BACKPRESSURE');
+        if (this.recoveries.size >= 1000) {
+          this.pruneExpiredLedgers(Date.now());
+          if (this.recoveries.size >= 1000) {
+            for (const [k, existing] of this.recoveries) {
+              if (existing.result !== undefined && !existing.inFlight) {
+                this.recoveries.delete(k);
+                break;
+              }
+            }
+          }
+          if (this.recoveries.size >= 1000)
+            throw new Error('RECOVERY_BACKPRESSURE');
+        }
         attempt = {
           requestId: randomUUID(),
           roomKey: details.room_key,
@@ -582,6 +634,7 @@ export class CollaborationRuntime {
                 lease_epoch: result.lease_epoch,
                 binding: result.binding,
               };
+              original.settledAt = Date.now();
               if (original.inFlight === pending) delete original.inFlight;
             },
             () => {
@@ -1300,32 +1353,105 @@ export class CollaborationRuntime {
     )
       throw new Error('PHP_SAVE_TARGET_INVALID');
     record.phase = 'completed';
+    record.settledAt = Date.now();
     return committed;
   }
 
   startMaintenance(): void {
     if (this.maintenance) throw new Error('MAINTENANCE_ALREADY_STARTED');
     this.maintenance = setInterval(() => {
+      const now = Date.now();
+      this.pruneExpiredLedgers(now);
       this.states.forEach((state) => {
         state.document
           ?.getConnections()
           .forEach((connection: Connection<Context>) => {
             const context = connection.context;
-            if (context.auth.lease_expires_at <= Date.now()) {
+            if (context.auth.lease_expires_at <= now) {
               this.connectionError(
                 connection,
                 'CONNECTION_AUTHORIZATION_EXPIRED'
               );
               return;
             }
-            if (!context.renewing && context.nextRenewal <= Date.now()) {
+            if (!context.renewing && context.nextRenewal <= now) {
               context.renewing = true;
-              this.track(this.renew(state, connection)).catch(() => {});
+              this.track(this.renew(state, connection)).catch((error) => {
+                console.error(
+                  '[peanut-hocuspocus] connection renewal failed:',
+                  error instanceof Error ? error.message : String(error)
+                );
+              });
             }
           });
       });
     }, 1000);
     this.maintenance.unref();
+  }
+
+  pruneExpiredLedgers(now: number = Date.now()): void {
+    for (const [docName, unloadedAt] of this.targetRecordUnloadedAt) {
+      if (this.states.has(docName)) {
+        this.targetRecordUnloadedAt.delete(docName);
+        continue;
+      }
+      if (now - unloadedAt >= ledgerTtlMs) {
+        this.targetRecords.delete(docName);
+        this.targetRecordUnloadedAt.delete(docName);
+      }
+    }
+    for (const [key, attempt] of this.recoveries) {
+      if (
+        attempt.result !== undefined &&
+        !attempt.inFlight &&
+        attempt.settledAt !== undefined &&
+        now - attempt.settledAt >= ledgerTtlMs
+      ) {
+        this.recoveries.delete(key);
+      }
+    }
+    for (const [key, fence] of this.controlOperations) {
+      if (
+        !fence.active &&
+        fence.releasedAt !== undefined &&
+        now - fence.releasedAt >= ledgerTtlMs
+      ) {
+        this.controlOperations.delete(key);
+      }
+    }
+    for (const [tuple, recordedAt] of this.invalidatedGrants) {
+      if (now - recordedAt >= ledgerTtlMs) {
+        this.invalidatedGrants.delete(tuple);
+      }
+    }
+    for (const [factId, recordedAt] of this.invalidationFactTimes) {
+      if (now - recordedAt >= ledgerTtlMs) {
+        this.invalidationFacts.delete(factId);
+        this.invalidationFactTimes.delete(factId);
+      }
+    }
+    for (const [opId, recordedAt] of this.invalidationOperationTimes) {
+      if (now - recordedAt >= ledgerTtlMs) {
+        this.invalidationOperations.delete(opId);
+        this.invalidationOperationTimes.delete(opId);
+      }
+    }
+    for (const [resultKey, recordedAt] of this.invalidationResultTimes) {
+      if (now - recordedAt >= ledgerTtlMs) {
+        this.invalidationResults.delete(resultKey);
+        this.invalidationResultTimes.delete(resultKey);
+      }
+    }
+  }
+
+  private evictOldestSettledTargetRecord(): void {
+    for (const [docName] of this.targetRecordUnloadedAt) {
+      if (!this.states.has(docName)) {
+        this.targetRecords.delete(docName);
+        this.targetRecordUnloadedAt.delete(docName);
+        return;
+      }
+    }
   }
   private async renew(
     state: State,
@@ -1422,6 +1548,8 @@ export class CollaborationRuntime {
     const previous = this.invalidationResults.get(resultKey);
     if (previous) return { ...previous };
 
+    const now = Date.now();
+    this.pruneExpiredLedgers(now);
     const targets = new Map(input.targets.map((target) => [target.connection_key, target]));
     const tuples = input.targets.map((target) => this.invalidationTuple(input.tenant_id, target));
     const additions = tuples.filter((tuple) => !this.invalidatedGrants.has(tuple));
@@ -1454,8 +1582,10 @@ export class CollaborationRuntime {
     });
 
     this.invalidationFacts.set(input.fact_id, fact);
+    this.invalidationFactTimes.set(input.fact_id, now);
     this.invalidationOperations.set(input.operation_id, input.scope_digest);
-    tuples.forEach((tuple) => this.invalidatedGrants.add(tuple));
+    this.invalidationOperationTimes.set(input.operation_id, now);
+    tuples.forEach((tuple) => this.invalidatedGrants.set(tuple, now));
     // Fence the whole batch before close callbacks, including duplicate SDK instances of one tuple.
     matches.forEach((connections) => connections.forEach((connection) => { connection.readOnly = true; }));
     let failed = false;
@@ -1483,6 +1613,7 @@ export class CollaborationRuntime {
       closed_count: matches.size,
     };
     this.invalidationResults.set(resultKey, ack);
+    this.invalidationResultTimes.set(resultKey, now);
     return { ...ack };
   }
 
@@ -1521,6 +1652,17 @@ export class CollaborationRuntime {
         if (phpJson(existing.input) !== phpJson(input))
           throw new Error('ORIGINAL_CONTROL_OPERATION_REQUIRED');
         return this.drainControl(existing);
+      }
+      if (this.controlOperations.size >= 1000) {
+        this.pruneExpiredLedgers(Date.now());
+        if (this.controlOperations.size >= 1000) {
+          for (const [opKey, oldFence] of this.controlOperations) {
+            if (!oldFence.active) {
+              this.controlOperations.delete(opKey);
+              break;
+            }
+          }
+        }
       }
       if (
         this.stopping ||
@@ -1773,6 +1915,7 @@ export class CollaborationRuntime {
         throw new Error('CONTROL_UNLOAD_UNCONFIRMED');
     }
     fence.active = false;
+    fence.releasedAt = Date.now();
     if (this.fences.get(input.room_key) === fence)
       this.fences.delete(input.room_key);
     return {
