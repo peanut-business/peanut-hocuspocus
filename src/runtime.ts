@@ -947,7 +947,11 @@ export class CollaborationRuntime {
         participant: { ...participant }, progress: state.progress,
       });
       state.references = new Set(after.fileKeys);
-    } catch {
+    } catch (error) {
+      console.warn('HOCUSPOCUS_RECORD_CHANGE_BLOCKED', {
+        room: document.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
       this.block(state, 'UPDATE_SOURCE_OR_PROJECTION_INVALID');
     }
   }
